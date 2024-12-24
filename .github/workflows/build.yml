@@ -32,7 +32,7 @@ jobs:
         --chip esp32s3 merge_bin -o $HOME/work/bbn_m5atomS3_lite_console/bbn_m5atomS3_lite_console/build/bbn_m5atomS3_lite_console_firmware.bin 
         --flash_mode dio --flash_freq 80m --flash_size 4MB 
         0x0 "$HOME/work/bbn_m5atomS3_lite_console/bbn_m5atomS3_lite_console/build/bbn_m5atomS3_lite_console.ino.bootloader.bin" 
-        0x8000 "$HOME/work/bbn_esp32_sensors_hub/bbn_m5atomS3_lite_console/build/bbn_m5atomS3_lite_console.ino.partitions.bin" 
+        0x8000 "$HOME/work/bbn_m5atomS3_lite_console/bbn_m5atomS3_lite_console/build/bbn_m5atomS3_lite_console.ino.partitions.bin" 
         0xe000 "$HOME/.arduino15/packages/esp32/hardware/esp32/2.0.17/tools/partitions/boot_app0.bin" 
         0x10000 "$HOME/work/bbn_m5atomS3_lite_console/bbn_m5atomS3_lite_console/build/bbn_m5atomS3_lite_console.ino.bin"
 
