@@ -1,56 +1,132 @@
-#include <M5AtomS3.h>
 
-//#define CONFIG_ESP_CONSOLE_USB_CDC
-//#undef CONFIG_ESP_CONSOLE_UART_DEFAULT 
-//#undef CONFIG_ESP_CONSOLE_UART_CUSTOM 
+/* Basic console example (esp_console_repl API)
 
-#include <M5Unified.h>
-#include <ESP32Console.h>
-#include <FS.h>
-#include <SPIFFS.h>
-#include <ESP32Console/Helpers/PWDHelpers.h>
+   This example code is in the Public Domain (or CC0 licensed, at your option.)
 
-using namespace ESP32Console;
+   Unless required by applicable law or agreed to in writing, this
+   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+   CONDITIONS OF ANY KIND, either express or implied.
+*/
 
-Console console;
+#define CONFIG_ESP_CONSOLE_SECONDARY_NONE 1
+#define CONFIG_ESP_CONSOLE_USB_CDC
+#undef CONFIG_ESP_CONSOLE_UART_DEFAULT 
+#undef CONFIG_ESP_CONSOLE_UART_CUSTOM 
 
-void setup() {
-  auto cfg = M5.config();
-  AtomS3.begin(cfg);
-  
-  //Initalize SPIFFS and mount it on /spiffs
-  //SPIFFS.begin(true, "/spiffs");
+#include <stdio.h>
+#include <string.h>
+#include <esp_system.h>
+#include <esp_log.h>
+#include <esp_console.h>
+#include <esp_vfs_dev.h>
+#include <esp_vfs_fat.h>
+#include <nvs.h>
+#include <nvs_flash.h>
+//#include <cmd_system.h>
+//#include <cmd_wifi.h>
+//#include <cmd_nvs.h>
 
-  //Modify prompt to show current file path (%pwd% get replaced by the filepath)
-  //console.setPrompt("ESP32 %pwd%> ");
-  console.setPrompt("m5> ");
+/*
+ * We warn if a secondary serial console is enabled. A secondary serial console is always output-only and
+ * hence not very useful for interactive console applications. If you encounter this warning, consider disabling
+ * the secondary serial console in menuconfig unless you know what you are doing.
+ */
+#if SOC_USB_SERIAL_JTAG_SUPPORTED
+#if !CONFIG_ESP_CONSOLE_SECONDARY_NONE
+#warning "A secondary serial console is not useful when using the console component. Please disable it in menuconfig."
+#endif
+#endif
 
-  //Set HOME env for easier navigating (type cd to jump to home)
-  setenv("HOME", "/spiffs", 1);
-  //Set PWD to env
-  //console_chdir("/spiffs");
+static const char* TAG = "example";
+#define PROMPT_STR CONFIG_IDF_TARGET
 
-  //Initialize Serial port on UART0 (the onboard USB Serial Converter)
-  //Serial.begin(115200);
+/* Console command history can be stored to and loaded from a file.
+ * The easiest way to do this is to use FATFS filesystem on top of
+ * wear_levelling library.
+ */
+#if CONFIG_CONSOLE_STORE_HISTORY
 
-  //console.begin(115200, G2, G3, 0);
-  console.begin(115200);
-  //Serial.begin(115200);
-  //Serial.begin(115200, G2, G3, 0);
+#define MOUNT_PATH "/data"
+#define HISTORY_PATH MOUNT_PATH "/history.txt"
 
-  //Enable the saving of our command history to SPIFFS. You will be able to see it, when you type ls in your console.
-  //console.enablePersistentHistory("/spiffs/.history.txt");
+static void initialize_filesystem(void)
+{
+    static wl_handle_t wl_handle;
+    const esp_vfs_fat_mount_config_t mount_config = {
+            .max_files = 4,
+            .format_if_mount_failed = true
+    };
+    esp_err_t err = esp_vfs_fat_spiflash_mount_rw_wl(MOUNT_PATH, "storage", &mount_config, &wl_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to mount FATFS (%s)", esp_err_to_name(err));
+        return;
+    }
+}
+#endif // CONFIG_STORE_HISTORY
 
-  console.registerSystemCommands();
-
-  //Register the VFS specific commands
-  //console.registerVFSCommands();
-
-  //delay(2000);
-  //Serial.flush();
+static void initialize_nvs(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK( nvs_flash_erase() );
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
 }
 
-void loop() {
-  AtomS3.update();
-  delay(100);
+void setup(void)
+{
+    esp_console_repl_t *repl = NULL;
+    esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
+    /* Prompt to be printed before each line.
+     * This can be customized, made dynamic, etc.
+     */
+    repl_config.prompt = PROMPT_STR ">";
+    repl_config.max_cmdline_length = 80; //CONFIG_CONSOLE_MAX_COMMAND_LINE_LENGTH;
+
+    //initialize_nvs();
+
+#if CONFIG_CONSOLE_STORE_HISTORY
+    initialize_filesystem();
+    repl_config.history_save_path = HISTORY_PATH;
+    ESP_LOGI(TAG, "Command history enabled");
+#else
+    ESP_LOGI(TAG, "Command history disabled");
+#endif
+
+    /* Register commands */
+    esp_console_register_help_command();
+    //register_system_common();
+#if SOC_LIGHT_SLEEP_SUPPORTED
+    register_system_light_sleep();
+#endif
+#if SOC_DEEP_SLEEP_SUPPORTED
+    register_system_deep_sleep();
+#endif
+#if (CONFIG_ESP_WIFI_ENABLED || CONFIG_ESP_HOST_WIFI_ENABLED)
+    register_wifi();
+#endif
+//    register_nvs();
+
+#if defined(CONFIG_ESP_CONSOLE_UART_DEFAULT) || defined(CONFIG_ESP_CONSOLE_UART_CUSTOM)
+    esp_console_dev_uart_config_t hw_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_console_new_repl_uart(&hw_config, &repl_config, &repl));
+
+#elif defined(CONFIG_ESP_CONSOLE_USB_CDC)
+    esp_console_dev_usb_cdc_config_t hw_config = ESP_CONSOLE_DEV_CDC_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_console_new_repl_usb_cdc(&hw_config, &repl_config, &repl));
+
+#elif defined(CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG)
+    esp_console_dev_usb_serial_jtag_config_t hw_config = ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_console_new_repl_usb_serial_jtag(&hw_config, &repl_config, &repl));
+
+#else
+#error Unsupported console type
+#endif
+
+    ESP_ERROR_CHECK(esp_console_start_repl(repl));
+}
+
+void loop(void) {
+  
 }
