@@ -8,11 +8,6 @@
    CONDITIONS OF ANY KIND, either express or implied.
 */
 
-#define CONFIG_ESP_CONSOLE_SECONDARY_NONE 1
-#define CONFIG_ESP_CONSOLE_USB_CDC
-#undef CONFIG_ESP_CONSOLE_UART_DEFAULT 
-#undef CONFIG_ESP_CONSOLE_UART_CUSTOM 
-
 #include <stdio.h>
 #include <string.h>
 #include <esp_system.h>
