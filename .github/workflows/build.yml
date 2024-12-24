@@ -15,7 +15,7 @@ jobs:
       uses: ArminJo/arduino-test-compile@v3
       with:
         arduino-board-fqbn: m5stack:esp32:m5stack_atoms3:CDCOnBoot=cdc
-        arduino-platform: esp32:esp32@2.3.4
+        arduino-platform: esp32:esp32@2.3.1
         platform-url: https://m5stack.oss-cn-shenzhen.aliyuncs.com/resource/arduino/package_m5stack_index.json
         required-libraries: M5AtomS3@1.0.0,M5Unified@0.2.2,ESP32Console@1.2.2
         sketch-names: "*.ino"
