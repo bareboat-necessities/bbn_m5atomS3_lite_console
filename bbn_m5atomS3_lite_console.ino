@@ -103,7 +103,7 @@ void setup(void)
 #endif
 //    register_nvs();
 
-#elif defined(CONFIG_ESP_CONSOLE_USB_CDC)
+#if defined(CONFIG_ESP_CONSOLE_USB_CDC)
     esp_console_dev_usb_cdc_config_t hw_config = ESP_CONSOLE_DEV_CDC_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_console_new_repl_usb_cdc(&hw_config, &repl_config, &repl));   
 #else
