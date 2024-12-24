@@ -10,8 +10,8 @@
 #include <nvs.h>
 #include <nvs_flash.h>
 //#include <cmd_system.h>
-#include <cmd_wifi.h>
-#include <cmd_nvs.h>
+//#include <cmd_wifi.h>
+//#include <cmd_nvs.h>
 
 /*
  * We warn if a secondary serial console is enabled. A secondary serial console is always output-only and
