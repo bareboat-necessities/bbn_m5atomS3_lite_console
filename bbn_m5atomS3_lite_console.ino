@@ -9,7 +9,7 @@
 #include <esp_vfs_fat.h>
 #include <nvs.h>
 #include <nvs_flash.h>
-#include <cmd_system.h>
+//#include <cmd_system.h>
 #include <cmd_wifi.h>
 #include <cmd_nvs.h>
 
