@@ -98,9 +98,7 @@ void setup(void)
 #if SOC_DEEP_SLEEP_SUPPORTED
     register_system_deep_sleep();
 #endif
-#if (CONFIG_ESP_WIFI_ENABLED || CONFIG_ESP_HOST_WIFI_ENABLED)
-    register_wifi();
-#endif
+
 //    register_nvs();
 
 #if defined(CONFIG_ESP_CONSOLE_USB_CDC)
