@@ -1,6 +1,8 @@
-#define CONFIG_ESP_CONSOLE_USB_CDC 1
-
 #include <M5AtomS3.h>
+#include <ESP32Console.h>
+
+using namespace ESP32Console;
+
 Console console;
 
 void setup() {   
