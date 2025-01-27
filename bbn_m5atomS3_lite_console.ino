@@ -12,9 +12,8 @@ void setup() {
     //Enable ESP32Console on Pin 12 & 14 on UART1
     console.begin(115200, 12, 14, 1);
 
-
     console.registerSystemCommands();
-    console.registerNetworkCommands();
+    //console.registerNetworkCommands();
 }
 
 void loop() {
