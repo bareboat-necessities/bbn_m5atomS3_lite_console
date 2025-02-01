@@ -9,8 +9,8 @@ void setup() {
   auto cfg = M5.config();
   AtomS3.begin(cfg);
 
-  //Serial2.begin(9600, SERIAL_8N1, G6, G5);  // UART pins when GPS is plugged into port C of ATOMIC PortABC Extension Base
-  //Serial2.begin(9600, SERIAL_8N1, G1, G2);  // UART pins when GPS is plugged directly into grove port of M5 AtomS3-lite
+  //Serial2.begin(9600, SERIAL_8N1, G6, G5);  // UART pins when USB-to-TTL is plugged into port C of ATOMIC PortABC Extension Base
+  //Serial2.begin(9600, SERIAL_8N1, G1, G2);  // UART pins when USB-to-TTL is plugged directly into grove port of M5 AtomS3-lite
 
   // Initialize Serial port on UART0 (the onboard USB Serial Converter)
   Serial.begin(115200);
