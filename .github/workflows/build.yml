@@ -22,7 +22,7 @@ jobs:
         required-libraries: M5AtomS3@1.0.0,M5Unified@0.2.5
         sketch-names: "*.ino"
         sketch-names-find-start: bbn_*
-        extra-arduino-cli-args: "--warnings default --build-property build.extra_flags=-DCONFIG_ESP_CONSOLE_USB_CDC=y,-DCONFIG_LIBC_STDOUT_LINE_ENDING_CRLF=y,-DCONFIG_LIBC_STDIN_LINE_ENDING_CR=y --build-property compiler.libraries.ldflags=-Wl,--allow-multiple-definition "
+        extra-arduino-cli-args: "--warnings default --build-property build.extra_flags=-DCONFIG_ESP_CONSOLE_USB_CDC=y -DCONFIG_LIBC_STDOUT_LINE_ENDING_CRLF=y -DCONFIG_LIBC_STDIN_LINE_ENDING_CR=y --build-property compiler.libraries.ldflags=-Wl,--allow-multiple-definition "
         set-build-path: true
 
     - name: Make zip
