@@ -75,9 +75,9 @@ static void initialize_console(void) {
   setvbuf(stdin, NULL, _IONBF, 0);
 
   /* Minicom, screen, idf_monitor send CR when ENTER key is pressed */
-  //esp_vfs_dev_cdcacm_set_rx_line_endings(ESP_LINE_ENDINGS_CR);
+  esp_vfs_dev_cdcacm_set_rx_line_endings(ESP_LINE_ENDINGS_CR);
   /* Move the caret to the beginning of the next line on '\n' */
-  //esp_vfs_dev_cdcacm_set_tx_line_endings(ESP_LINE_ENDINGS_CRLF);
+  esp_vfs_dev_cdcacm_set_tx_line_endings(ESP_LINE_ENDINGS_CRLF);
 
   /* Enable non-blocking mode on stdin and stdout */
   fcntl(fileno(stdout), F_SETFL, 0);
