@@ -472,20 +472,32 @@ private:
 
   void setup_routes(WebServer& s) {
     s.on("/", HTTP_GET, [this, &s]() {
-      String ip = WiFi.localIP().toString();
-      String ssid = WiFi.SSID();
+      const String ip   = WiFi.localIP().toString();
+      const String ssid = WiFi.SSID();
+    
       String html;
-      html.reserve(1024);
-      html += "<!doctype html><html><head><meta charset='utf-8'>"
-              "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-              "<title>ESP32S3</title></head><body>"
-              "<h2>ESP32S3 Web Console</h2>";
-      html += "<p><b>SSID:</b> " + ssid + "<br><b>IP:</b> " + ip + "</p>";
-      html += "<ul>"
-              "<li><a href='/status'>/status</a></li>"
-              "</ul>";
-      html += "<p>Use serial console for commands.</p>";
-      html += "</body></html>";
+      html.reserve(900);
+    
+      html += "<!doctype html><meta charset=utf-8>"
+              "<meta name=viewport content='width=device-width,initial-scale=1'>"
+              "<title>ESP32S3</title>"
+              "<style>"
+              ":root{color-scheme:dark}"
+              "body{margin:0;font:16px system-ui;background:#0b0f14;color:#e6edf3}"
+              "main{max-width:640px;margin:0 auto;padding:16px}"
+              "section{background:#0f1620;border:1px solid #223044;border-radius:12px;padding:14px}"
+              "h1{margin:0 0 10px;font-size:18px}"
+              "p{margin:8px 0;color:#c9d6e4}"
+              "a{color:#8ab4ff;text-decoration:none}a:hover{text-decoration:underline}"
+              "code{background:#111b28;border:1px solid #223044;border-radius:8px;padding:2px 6px}"
+              "</style>"
+              "<main><section><h1>ESP32S3</h1>";
+    
+      html += "<p>SSID: <code>" + ssid + "</code><br>IP: <code>" + ip + "</code></p>"
+              "<p><a href=/status>/status</a></p>"
+              "<p style='margin-top:12px;color:#9fb2c7;font-size:13px'>Use serial console for commands.</p>"
+              "</section></main>";
+    
       s.send(200, "text/html", html);
     });
 
