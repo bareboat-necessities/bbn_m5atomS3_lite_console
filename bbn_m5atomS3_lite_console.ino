@@ -1,13 +1,12 @@
 /*
-  Arduino-ESP32 3.3.5: Serial-backed esp_console with bash-like history/editing.
+  Arduino-ESP32 3.3.5 USB CDC console with:
+   - ANSI line editor (mid-line cursor, insert/delete)
+   - Up/Down history (PuTTY ESC [ A / ESC [ B)
+   - Persistent history in NVS across reboot
+   - Compact, stable help (no corruption)
 
-  - Transport: Serial (USB CDC or USB Serial/JTAG depending on board options)
-  - Output: printf routed to Serial via esp_log_set_vprintf()
-  - History: Up/Down arrows + Ctrl+P/Ctrl+N, Ctrl+R reverse search
-  - Editing: left/right, backspace, delete, home/end
-
-  Recommended AtomS3 board options:
-    USBMode=hwcdc, CDCOnBoot=cdc
+  Commands:
+    help, free, chip, uptime, reboot, echo, history, keys, term
 */
 
 #define CONFIG_ESP_CONSOLE_USB_CDC 1
@@ -18,64 +17,85 @@
 
 #include <esp_console.h>
 #include <esp_err.h>
-#include <esp_log.h>
 #include <argtable3/argtable3.h>
+
+#include <nvs.h>
 #include <nvs_flash.h>
 
-#include <esp_heap_caps.h>
 #include <esp_system.h>
 #include <esp_chip_info.h>
+#include <esp_heap_caps.h>
 #include <esp_timer.h>
 
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
-
-#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 
-// -------------------- Serial-backed printf/vprintf --------------------
+// -------------------- CRLF-safe print helpers (DO NOT use printf) --------------------
 
-static int serial_vprintf(const char *fmt, va_list ap) {
-  char buf[512];
-  int n = vsnprintf(buf, sizeof(buf), fmt, ap);
-  if (n <= 0) return n;
-
-  size_t to_write = (size_t)min(n, (int)sizeof(buf) - 1);
-
-#if CONFIG_LIBC_STDOUT_LINE_ENDING_CRLF
-  for (size_t i = 0; i < to_write; i++) {
-    char c = buf[i];
-    if (c == '\n') Serial.write('\r');
-    Serial.write((uint8_t)c);
-  }
-#else
-  Serial.write((const uint8_t*)buf, to_write);
-#endif
-
-  return n;
+static inline void out_raw(const char* s) {
+  if (s) Serial.print(s);
 }
 
-static inline void serial_newline() {
-#if CONFIG_LIBC_STDOUT_LINE_ENDING_CRLF
-  Serial.write("\r\n");
-#else
-  Serial.write("\n");
-#endif
+static inline void out_crlf() {
+  Serial.print("\r\n");
 }
 
-// -------------------- History + Editor constants --------------------
-// NOTE: don't name this LINE_MAX (conflicts with toolchain macros)
+template <typename... Args>
+static void out_printf(const char* fmt, Args... args) {
+  Serial.printf(fmt, args...);
+}
+
+template <typename... Args>
+static void out_printfln(const char* fmt, Args... args) {
+  Serial.printf(fmt, args...);
+  out_crlf();
+}
+
+// -------------------- Constants --------------------
+
 static constexpr int CONSOLE_LINE_MAX = 256;
 static constexpr int HIST_MAX = 32;
 
-// -------------------- History (ring buffer) --------------------
+// -------------------- Terminal mode --------------------
+
+static bool g_term_ansi = true; // PuTTY supports ANSI
+
+// -------------------- Persistent history in NVS --------------------
+
+static constexpr const char* NVS_NS = "console";
+static constexpr const char* KEY_HEAD  = "h_head";
+static constexpr const char* KEY_COUNT = "h_count";
+
+static void nvs_key_for_slot(char* out, size_t cap, int slot) {
+  snprintf(out, cap, "h%02d", slot); // h00..h31
+}
+
+static bool nvs_read_i32(nvs_handle_t h, const char* key, int32_t& outv) {
+  return nvs_get_i32(h, key, &outv) == ESP_OK;
+}
+
+static void nvs_write_i32(nvs_handle_t h, const char* key, int32_t v) {
+  (void)nvs_set_i32(h, key, v);
+}
+
+static bool nvs_read_str(nvs_handle_t h, const char* key, char* out, size_t out_cap) {
+  size_t required = 0;
+  esp_err_t err = nvs_get_str(h, key, nullptr, &required);
+  if (err != ESP_OK || required == 0 || required > out_cap) return false;
+  return nvs_get_str(h, key, out, &required) == ESP_OK;
+}
+
+static void nvs_write_str(nvs_handle_t h, const char* key, const char* s) {
+  (void)nvs_set_str(h, key, s ? s : "");
+}
+
+// -------------------- History ring --------------------
 
 struct History {
   char items[HIST_MAX][CONSOLE_LINE_MAX];
-  int  count = 0;   // number of stored items (<= HIST_MAX)
-  int  head  = 0;   // next write index
-  int  nav   = 0;   // navigation offset (0=current, 1=most recent, ...)
+  int  count = 0;
+  int  head  = 0;
+  int  nav   = 0;
   char scratch[CONSOLE_LINE_MAX];
 
   void reset_nav() { nav = 0; }
@@ -93,10 +113,50 @@ struct History {
     return items[idx];
   }
 
+  void load_from_nvs() {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+
+    int32_t n_head = 0, n_count = 0;
+    if (!nvs_read_i32(h, KEY_HEAD, n_head)) n_head = 0;
+    if (!nvs_read_i32(h, KEY_COUNT, n_count)) n_count = 0;
+
+    if (n_head < 0 || n_head >= HIST_MAX) n_head = 0;
+    if (n_count < 0 || n_count > HIST_MAX) n_count = 0;
+
+    head = (int)n_head;
+    count = (int)n_count;
+    nav = 0;
+    scratch[0] = 0;
+
+    for (int i = 0; i < HIST_MAX; i++) {
+      items[i][0] = 0;
+      char key[8];
+      nvs_key_for_slot(key, sizeof(key), i);
+      (void)nvs_read_str(h, key, items[i], sizeof(items[i]));
+    }
+    nvs_close(h);
+  }
+
+  void persist_add(const char* s) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+
+    int slot = (head + HIST_MAX - 1) % HIST_MAX;
+    char key[8];
+    nvs_key_for_slot(key, sizeof(key), slot);
+    nvs_write_str(h, key, s);
+
+    nvs_write_i32(h, KEY_HEAD, (int32_t)head);
+    nvs_write_i32(h, KEY_COUNT, (int32_t)count);
+
+    (void)nvs_commit(h);
+    nvs_close(h);
+  }
+
   void add(const char* s) {
     if (!s || !*s) return;
 
-    // Avoid duplicates of last command
     if (count > 0) {
       int last = (head - 1 + HIST_MAX) % HIST_MAX;
       if (strncmp(items[last], s, CONSOLE_LINE_MAX) == 0) return;
@@ -104,9 +164,12 @@ struct History {
 
     strncpy(items[head], s, CONSOLE_LINE_MAX - 1);
     items[head][CONSOLE_LINE_MAX - 1] = 0;
+
     head = (head + 1) % HIST_MAX;
     if (count < HIST_MAX) count++;
     nav = 0;
+
+    persist_add(s);
   }
 
   const char* older(const char* current_line) {
@@ -126,20 +189,6 @@ struct History {
 
 static History g_hist;
 
-// Reverse search: first match from most recent backwards
-static bool hist_reverse_search(const char* query, char* out, size_t out_cap) {
-  if (!query) query = "";
-  for (int k = 1; k <= g_hist.count; k++) {
-    const char* s = g_hist.get_by_recent_index(k);
-    if (s && strstr(s, query)) {
-      strncpy(out, s, out_cap - 1);
-      out[out_cap - 1] = 0;
-      return true;
-    }
-  }
-  return false;
-}
-
 // -------------------- Serial input helpers --------------------
 
 static int read_byte_blocking() {
@@ -147,69 +196,79 @@ static int read_byte_blocking() {
   return Serial.read();
 }
 
-// Read rest of ANSI escape sequence after ESC.
-// Returns true and NUL-terminates seq.
 static bool read_esc_sequence(char* seq, size_t cap) {
   size_t n = 0;
   uint32_t t0 = millis();
+  const uint32_t timeout_ms = 250;
 
   while (n + 1 < cap) {
     while (Serial.available() == 0) {
-      if (millis() - t0 > 30) { // short timeout
-        seq[n] = 0;
-        return (n > 0);
-      }
+      if (millis() - t0 > timeout_ms) { seq[n] = 0; return (n > 0); }
       delay(1);
     }
     char c = (char)Serial.read();
     seq[n++] = c;
     seq[n] = 0;
 
-    // typical terminators
-    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '~') {
-      return true;
-    }
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '~') return true;
   }
+
   seq[cap - 1] = 0;
   return true;
 }
 
+static bool seq_ends_with(const char* s, char c) {
+  if (!s) return false;
+  size_t L = strlen(s);
+  return L > 0 && s[L - 1] == c;
+}
+
+static bool seq_is_up(const char* s)   { return s && (strcmp(s,"[A")==0 || strcmp(s,"OA")==0 || seq_ends_with(s,'A')); }
+static bool seq_is_down(const char* s) { return s && (strcmp(s,"[B")==0 || strcmp(s,"OB")==0 || seq_ends_with(s,'B')); }
+static bool seq_is_right(const char* s){ return s && (strcmp(s,"[C")==0 || strcmp(s,"OC")==0 || seq_ends_with(s,'C')); }
+static bool seq_is_left(const char* s) { return s && (strcmp(s,"[D")==0 || strcmp(s,"OD")==0 || seq_ends_with(s,'D')); }
+static bool seq_is_home(const char* s) { return s && (strcmp(s,"[H")==0 || strcmp(s,"OH")==0 || strcmp(s,"[1~")==0); }
+static bool seq_is_end(const char* s)  { return s && (strcmp(s,"[F")==0 || strcmp(s,"OF")==0 || strcmp(s,"[4~")==0); }
+static bool seq_is_del(const char* s)  { return s && (strcmp(s,"[3~")==0); }
+
+// -------------------- Redraw with stable ANSI behavior --------------------
+
 static void redraw_line(const char* prompt, const char* buf, size_t len, size_t cursor) {
-  // Go to line start, clear line, print prompt+buffer, then move cursor back if needed.
   Serial.write('\r');
-  Serial.write("\x1b[2K"); // ANSI clear line
+  if (g_term_ansi) Serial.write("\x1b[2K"); // clear full line
 
   Serial.print(prompt);
   if (len) Serial.write((const uint8_t*)buf, len);
 
-  size_t back = len - cursor;
-  if (back > 0) {
-    char tmp[24];
-    snprintf(tmp, sizeof(tmp), "\x1b[%uD", (unsigned)back);
-    Serial.write(tmp);
+  if (g_term_ansi) {
+    size_t back = len - cursor;
+    if (back > 0) {
+      char tmp[24];
+      snprintf(tmp, sizeof(tmp), "\x1b[%uD", (unsigned)back);
+      Serial.write(tmp);
+    }
   }
 }
 
-// Line editor with bash-ish behavior.
-// Returns true with out filled; false on error.
+// -------------------- Line editor (mid-line) --------------------
+
 static bool read_line_edit(char* out, size_t out_cap, const char* prompt) {
   char buf[CONSOLE_LINE_MAX] = {0};
   size_t len = 0;
   size_t cursor = 0;
 
   g_hist.reset_nav();
-
   Serial.print(prompt);
 
   while (true) {
     int ch = read_byte_blocking();
     if (ch < 0) continue;
-    char c = (char)ch;
+    uint8_t uc = (uint8_t)ch;
+    char c = (char)uc;
 
-    // Enter handling
 #if CONFIG_LIBC_STDIN_LINE_ENDING_CR
     if (c == '\r' || c == '\n') {
-      serial_newline();
+      out_crlf();
       buf[len] = 0;
       strncpy(out, buf, out_cap - 1);
       out[out_cap - 1] = 0;
@@ -217,7 +276,7 @@ static bool read_line_edit(char* out, size_t out_cap, const char* prompt) {
     }
 #else
     if (c == '\n') {
-      serial_newline();
+      out_crlf();
       buf[len] = 0;
       strncpy(out, buf, out_cap - 1);
       out[out_cap - 1] = 0;
@@ -227,17 +286,17 @@ static bool read_line_edit(char* out, size_t out_cap, const char* prompt) {
 #endif
 
     // Control keys
-    if ((uint8_t)c < 0x20) {
-      switch (c) {
-        case 0x01: // Ctrl+A (home)
+    if (uc < 0x20) {
+      switch (uc) {
+        case 0x01: // Ctrl+A
           cursor = 0;
           redraw_line(prompt, buf, len, cursor);
           break;
-        case 0x05: // Ctrl+E (end)
+        case 0x05: // Ctrl+E
           cursor = len;
           redraw_line(prompt, buf, len, cursor);
           break;
-        case 0x10: { // Ctrl+P (prev)
+        case 0x10: { // Ctrl+P
           const char* h = g_hist.older(buf);
           if (h) {
             strncpy(buf, h, sizeof(buf) - 1);
@@ -247,7 +306,7 @@ static bool read_line_edit(char* out, size_t out_cap, const char* prompt) {
             redraw_line(prompt, buf, len, cursor);
           }
         } break;
-        case 0x0E: { // Ctrl+N (next)
+        case 0x0E: { // Ctrl+N
           const char* h = g_hist.newer();
           if (h) {
             strncpy(buf, h, sizeof(buf) - 1);
@@ -257,22 +316,22 @@ static bool read_line_edit(char* out, size_t out_cap, const char* prompt) {
             redraw_line(prompt, buf, len, cursor);
           }
         } break;
-        case 0x12: { // Ctrl+R reverse search
+        case 0x12: { // Ctrl+R (simple reverse search UI)
           char query[64] = {0};
           size_t qlen = 0;
           char match[CONSOLE_LINE_MAX] = {0};
 
           while (true) {
             Serial.write('\r');
-            Serial.write("\x1b[2K");
+            if (g_term_ansi) Serial.write("\x1b[2K");
             Serial.print("(reverse-i-search)`");
             if (qlen) Serial.write((const uint8_t*)query, qlen);
             Serial.print("': ");
             Serial.print(match);
 
             int k = read_byte_blocking();
-            if (k < 0) continue;
-            char kc = (char)k;
+            uint8_t uk = (uint8_t)k;
+            char kc = (char)uk;
 
             if (kc == '\r' || kc == '\n') {
               if (match[0]) {
@@ -281,41 +340,48 @@ static bool read_line_edit(char* out, size_t out_cap, const char* prompt) {
                 len = strnlen(buf, sizeof(buf) - 1);
                 cursor = len;
               }
-              serial_newline();
+              out_crlf();
               redraw_line(prompt, buf, len, cursor);
               break;
             }
-            if ((uint8_t)kc == 0x1B) { // ESC cancels
-              serial_newline();
+            if (uk == 0x1B) { // ESC cancels
+              out_crlf();
               redraw_line(prompt, buf, len, cursor);
               break;
             }
-            if (kc == '\b' || (uint8_t)kc == 0x7F) {
+            if (kc == '\b' || uk == 0x7F) {
               if (qlen > 0) query[--qlen] = 0;
-            } else if ((uint8_t)kc >= 0x20 && qlen + 1 < sizeof(query)) {
+            } else if (uk >= 0x20 && qlen + 1 < sizeof(query)) {
               query[qlen++] = kc;
               query[qlen] = 0;
             }
 
             match[0] = 0;
-            (void)hist_reverse_search(query, match, sizeof(match));
+            // Find first match backwards
+            for (int kk = 1; kk <= g_hist.count; kk++) {
+              const char* s = g_hist.get_by_recent_index(kk);
+              if (s && strstr(s, query)) {
+                strncpy(match, s, sizeof(match) - 1);
+                match[sizeof(match) - 1] = 0;
+                break;
+              }
+            }
           }
         } break;
         case 0x03: // Ctrl+C clears line
-          serial_newline();
+          out_crlf();
           buf[0] = 0;
           len = cursor = 0;
           Serial.print(prompt);
           break;
         default:
-          // ignore other control keys
           break;
       }
       continue;
     }
 
-    // Backspace / DEL
-    if (c == '\b' || (uint8_t)c == 0x7F) {
+    // Backspace
+    if (c == '\b' || uc == 0x7F) {
       if (cursor > 0 && len > 0) {
         memmove(&buf[cursor - 1], &buf[cursor], len - cursor);
         len--;
@@ -326,12 +392,12 @@ static bool read_line_edit(char* out, size_t out_cap, const char* prompt) {
       continue;
     }
 
-    // ANSI escape sequences
-    if ((uint8_t)c == 0x1B) {
-      char seq[16] = {0};
+    // ESC sequences
+    if (uc == 0x1B) {
+      char seq[24] = {0};
       if (!read_esc_sequence(seq, sizeof(seq))) continue;
 
-      if (strcmp(seq, "[A") == 0) { // Up
+      if (seq_is_up(seq)) {
         const char* h = g_hist.older(buf);
         if (h) {
           strncpy(buf, h, sizeof(buf) - 1);
@@ -340,7 +406,7 @@ static bool read_line_edit(char* out, size_t out_cap, const char* prompt) {
           cursor = len;
           redraw_line(prompt, buf, len, cursor);
         }
-      } else if (strcmp(seq, "[B") == 0) { // Down
+      } else if (seq_is_down(seq)) {
         const char* h = g_hist.newer();
         if (h) {
           strncpy(buf, h, sizeof(buf) - 1);
@@ -349,23 +415,17 @@ static bool read_line_edit(char* out, size_t out_cap, const char* prompt) {
           cursor = len;
           redraw_line(prompt, buf, len, cursor);
         }
-      } else if (strcmp(seq, "[C") == 0) { // Right
-        if (cursor < len) {
-          cursor++;
-          redraw_line(prompt, buf, len, cursor);
-        }
-      } else if (strcmp(seq, "[D") == 0) { // Left
-        if (cursor > 0) {
-          cursor--;
-          redraw_line(prompt, buf, len, cursor);
-        }
-      } else if (strcmp(seq, "[H") == 0 || strcmp(seq, "OH") == 0) { // Home
+      } else if (seq_is_left(seq)) {
+        if (cursor > 0) { cursor--; redraw_line(prompt, buf, len, cursor); }
+      } else if (seq_is_right(seq)) {
+        if (cursor < len) { cursor++; redraw_line(prompt, buf, len, cursor); }
+      } else if (seq_is_home(seq)) {
         cursor = 0;
         redraw_line(prompt, buf, len, cursor);
-      } else if (strcmp(seq, "[F") == 0 || strcmp(seq, "OF") == 0) { // End
+      } else if (seq_is_end(seq)) {
         cursor = len;
         redraw_line(prompt, buf, len, cursor);
-      } else if (strcmp(seq, "[3~") == 0) { // Delete at cursor
+      } else if (seq_is_del(seq)) {
         if (cursor < len) {
           memmove(&buf[cursor], &buf[cursor + 1], len - cursor - 1);
           len--;
@@ -376,13 +436,13 @@ static bool read_line_edit(char* out, size_t out_cap, const char* prompt) {
       continue;
     }
 
-    // Printable: insert at cursor
-    if (len + 1 < sizeof(buf) && (uint8_t)c >= 0x20) {
+    // Printable insert at cursor
+    if (uc >= 0x20 && len + 1 < sizeof(buf)) {
       if (cursor == len) {
         buf[len++] = c;
         cursor++;
         buf[len] = 0;
-        Serial.write((uint8_t)c); // echo
+        Serial.write((uint8_t)c);
       } else {
         memmove(&buf[cursor + 1], &buf[cursor], len - cursor);
         buf[cursor] = c;
@@ -391,58 +451,48 @@ static bool read_line_edit(char* out, size_t out_cap, const char* prompt) {
         buf[len] = 0;
         redraw_line(prompt, buf, len, cursor);
       }
+      continue;
     }
   }
 }
 
-// -------------------- Commands --------------------
+// -------------------- Commands (Serial-only output) --------------------
 
-// heap
-static int cmd_heap(int, char**) {
-  uint32_t hs = heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT);
-  printf("min heap size: %u\n", (unsigned)hs);
+static int cmd_help(int, char**) {
+  out_printfln("Commands: help free chip uptime reboot echo history keys term");
+  out_printfln("Keys: Up/Down hist, Ctrl+P/N hist, Ctrl+R search. term ansi|dumb");
   return ESP_OK;
 }
 
-// free
 static int cmd_free(int, char**) {
-  printf("heap_free: %u\n", (unsigned)esp_get_free_heap_size());
-  printf("heap_min_free: %u\n", (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT));
+  out_printfln("heap_free=%u heap_min_free=%u",
+               (unsigned)esp_get_free_heap_size(),
+               (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT));
   return ESP_OK;
 }
 
-// chip
 static int cmd_chip(int, char**) {
   esp_chip_info_t info;
   esp_chip_info(&info);
-
   const char* model = "unknown";
   if (info.model == CHIP_ESP32S3) model = "S3";
   else if (info.model == CHIP_ESP32S2) model = "S2";
   else if (info.model == CHIP_ESP32C3) model = "C3";
   else if (info.model == CHIP_ESP32C6) model = "C6";
 
-  printf("model: ESP32-%s\n", model);
-  printf("cores: %d\n", info.cores);
-  printf("revision: %d\n", info.revision);
-  printf("features: WiFi%s BLE%s\n",
-         (info.features & CHIP_FEATURE_WIFI_BGN) ? "+" : "-",
-         (info.features & CHIP_FEATURE_BLE) ? "+" : "-");
-  printf("flash size: %u bytes\n", (unsigned)ESP.getFlashChipSize());
+  out_printfln("ESP32-%s cores=%d rev=%d flash=%u",
+               model, info.cores, info.revision, (unsigned)ESP.getFlashChipSize());
   return ESP_OK;
 }
 
-// uptime
 static int cmd_uptime(int, char**) {
-  uint64_t us = (uint64_t)esp_timer_get_time();
-  double s = (double)us * 1e-6;
-  printf("uptime: %.3f s\n", s);
+  double s = (double)esp_timer_get_time() * 1e-6;
+  out_printfln("uptime=%.3fs", s);
   return ESP_OK;
 }
 
-// reboot
 static int cmd_reboot(int, char**) {
-  printf("restarting...\n");
+  out_printfln("restarting...");
   delay(50);
   ESP.restart();
   return ESP_OK;
@@ -457,82 +507,88 @@ static struct {
 static int cmd_echo(int argc, char** argv) {
   int nerrors = arg_parse(argc, argv, (void**)&echo_args);
   if (nerrors != 0) {
-    arg_print_errors(stderr, echo_args.end, argv[0]);
+    out_printfln("usage: echo [text...]");
     return ESP_ERR_INVALID_ARG;
   }
-
   if (echo_args.text && echo_args.text->count > 0) {
     for (int i = 0; i < echo_args.text->count; i++) {
-      printf("%s%s", echo_args.text->sval[i],
-             (i + 1 == echo_args.text->count) ? "\n" : " ");
+      Serial.print(echo_args.text->sval[i]);
+      if (i + 1 < echo_args.text->count) Serial.print(' ');
     }
+    out_crlf();
   } else {
-    printf("\n");
+    out_crlf();
   }
   return ESP_OK;
 }
 
-// loglevel <tag> <level>
+// history [n]
 static struct {
-  struct arg_str* tag;
-  struct arg_str* level;
+  struct arg_int* n;
   struct arg_end* end;
-} loglevel_args;
+} history_args;
 
-static int cmd_loglevel(int argc, char** argv) {
-  int nerrors = arg_parse(argc, argv, (void**)&loglevel_args);
+static int cmd_history(int argc, char** argv) {
+  int nerrors = arg_parse(argc, argv, (void**)&history_args);
   if (nerrors != 0) {
-    arg_print_errors(stderr, loglevel_args.end, argv[0]);
+    out_printfln("usage: history [n]");
     return ESP_ERR_INVALID_ARG;
   }
 
-  const char* tag = loglevel_args.tag->sval[0];
-  const char* lvl = loglevel_args.level->sval[0];
-
-  esp_log_level_t level = ESP_LOG_INFO;
-  if      (!strcasecmp(lvl, "none"))    level = ESP_LOG_NONE;
-  else if (!strcasecmp(lvl, "error"))   level = ESP_LOG_ERROR;
-  else if (!strcasecmp(lvl, "warn"))    level = ESP_LOG_WARN;
-  else if (!strcasecmp(lvl, "info"))    level = ESP_LOG_INFO;
-  else if (!strcasecmp(lvl, "debug"))   level = ESP_LOG_DEBUG;
-  else if (!strcasecmp(lvl, "verbose")) level = ESP_LOG_VERBOSE;
-  else {
-    printf("level must be one of: none,error,warn,info,debug,verbose\n");
-    return ESP_ERR_INVALID_ARG;
+  int want = g_hist.count;
+  if (history_args.n->count > 0) {
+    want = history_args.n->ival[0];
+    if (want < 0) want = 0;
+    if (want > g_hist.count) want = g_hist.count;
   }
 
-  esp_log_level_set(tag, level);
-  printf("log level set: tag='%s' level=%s\n", tag, lvl);
+  int line_no = g_hist.count - want + 1;
+  for (int k = want; k >= 1; k--) {
+    const char* s = g_hist.get_by_recent_index(k);
+    if (!s) continue;
+    out_printfln("%5d  %s", line_no++, s);
+  }
   return ESP_OK;
 }
 
-// freq [hz]  (demo config variable)
-static volatile double g_freq_hz = 0.30;
+static int cmd_keys(int, char**) {
+  out_printfln("Key dump 5s. Press keys:");
+  uint32_t t0 = millis();
+  while (millis() - t0 < 5000) {
+    while (Serial.available()) {
+      uint8_t b = (uint8_t)Serial.read();
+      Serial.printf("%02X ", (unsigned)b);
+    }
+    delay(5);
+  }
+  out_crlf();
+  out_printfln("Done.");
+  return ESP_OK;
+}
 
+// term <ansi|dumb>
 static struct {
-  struct arg_dbl* hz;
+  struct arg_str* mode;
   struct arg_end* end;
-} freq_args;
+} term_args;
 
-static int cmd_freq(int argc, char** argv) {
-  int nerrors = arg_parse(argc, argv, (void**)&freq_args);
+static int cmd_term(int argc, char** argv) {
+  int nerrors = arg_parse(argc, argv, (void**)&term_args);
   if (nerrors != 0) {
-    arg_print_errors(stderr, freq_args.end, argv[0]);
+    out_printfln("usage: term ansi|dumb");
     return ESP_ERR_INVALID_ARG;
   }
-
-  if (freq_args.hz->count == 0) {
-    printf("freq_hz: %.6f\n", g_freq_hz);
-    return ESP_OK;
-  }
-
-  double v = freq_args.hz->dval[0];
-  if (!(v > 0.0 && v < 1000.0)) {
-    printf("hz out of range\n");
+  const char* m = term_args.mode->sval[0];
+  if (!strcasecmp(m, "ansi")) {
+    g_term_ansi = true;
+    out_printfln("term=ansi");
+  } else if (!strcasecmp(m, "dumb")) {
+    g_term_ansi = false;
+    out_printfln("term=dumb");
+  } else {
+    out_printfln("usage: term ansi|dumb");
     return ESP_ERR_INVALID_ARG;
   }
-  g_freq_hz = v;
-  printf("freq_hz set to %.6f\n", g_freq_hz);
   return ESP_OK;
 }
 
@@ -549,27 +605,24 @@ static void register_cmd(const char* name, const char* help, esp_console_cmd_fun
 }
 
 static void register_commands() {
-  // required argtables
   echo_args.text = arg_strn(nullptr, nullptr, "<text>", 0, 32, "Text to echo");
   echo_args.end  = arg_end(2);
 
-  loglevel_args.tag   = arg_str1(nullptr, nullptr, "<tag>", "Log tag (use '*' for all)");
-  loglevel_args.level = arg_str1(nullptr, nullptr, "<level>", "none|error|warn|info|debug|verbose");
-  loglevel_args.end   = arg_end(2);
+  history_args.n  = arg_int0(nullptr, nullptr, "<n>", "Print last n history entries");
+  history_args.end = arg_end(2);
 
-  freq_args.hz  = arg_dbl0(nullptr, nullptr, "<hz>", "Get/set demo frequency");
-  freq_args.end = arg_end(2);
+  term_args.mode = arg_str1(nullptr, nullptr, "<mode>", "ansi|dumb");
+  term_args.end  = arg_end(2);
 
-  // register
-  esp_console_register_help_command();
-  register_cmd("heap",     "Minimum free heap seen during execution", &cmd_heap);
-  register_cmd("free",     "Current heap free + min free",            &cmd_free);
-  register_cmd("chip",     "Chip info",                               &cmd_chip);
-  register_cmd("uptime",   "Uptime",                                  &cmd_uptime);
-  register_cmd("reboot",   "Restart the MCU",                         &cmd_reboot);
-  register_cmd("echo",     "Echo arguments",                          &cmd_echo,     &echo_args);
-  register_cmd("loglevel", "Set log level: loglevel <tag> <level>",   &cmd_loglevel, &loglevel_args);
-  register_cmd("freq",     "Get/set demo frequency: freq [hz]",       &cmd_freq,     &freq_args);
+  register_cmd("help",    "Show commands (compact)",           &cmd_help);
+  register_cmd("free",    "Heap free/min",                     &cmd_free);
+  register_cmd("chip",    "Chip info",                         &cmd_chip);
+  register_cmd("uptime",  "Uptime",                            &cmd_uptime);
+  register_cmd("reboot",  "Restart MCU",                       &cmd_reboot);
+  register_cmd("echo",    "Echo arguments",                    &cmd_echo,    &echo_args);
+  register_cmd("history", "Show history: history [n]",         &cmd_history, &history_args);
+  register_cmd("keys",    "Dump raw key bytes (diagnostic)",   &cmd_keys);
+  register_cmd("term",    "Terminal mode: term ansi|dumb",     &cmd_term,    &term_args);
 }
 
 // -------------------- Arduino setup/loop --------------------
@@ -582,15 +635,14 @@ void setup() {
   uint32_t t0 = millis();
   while (!Serial && (millis() - t0) < 1500) delay(10);
 
-  // Route printf() (and ESP_LOG*) to Serial
-  esp_log_set_vprintf(&serial_vprintf);
-
-  // NVS init (safe)
+  // NVS init
   esp_err_t err = nvs_flash_init();
   if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-    ESP_ERROR_CHECK(nvs_flash_erase());
-    ESP_ERROR_CHECK(nvs_flash_init());
+    (void)nvs_flash_erase();
+    (void)nvs_flash_init();
   }
+
+  g_hist.load_from_nvs();
 
   // esp_console init
   esp_console_config_t cfg = {};
@@ -600,9 +652,8 @@ void setup() {
 
   register_commands();
 
-  printf("\nESP console ready.\n");
-  printf("History: Up/Down arrows, Ctrl+P/Ctrl+N. Reverse search: Ctrl+R.\n");
-  printf("Try: help, heap, free, chip, uptime, loglevel * debug, freq 0.3\n\n");
+  out_printfln("");
+  out_printfln("Ready. Type 'help'.");
 }
 
 void loop() {
@@ -618,21 +669,22 @@ void loop() {
   while (*p == ' ' || *p == '\t') p++;
   if (*p == 0) return;
 
-  // Store after entry (bash-like)
   g_hist.add(p);
 
-  int ret = 0;
-  esp_err_t err = esp_console_run(p, &ret);
+  // IMPORTANT: start command output on a clean line
+  out_crlf();
 
-  if (err == ESP_ERR_NOT_FOUND) {
-    printf("Unrecognized command\n");
-  } else if (err == ESP_ERR_INVALID_ARG) {
-    // empty command
-  } else if (err == ESP_OK && ret != ESP_OK) {
-    printf("Command returned non-zero error code: 0x%x (%s)\n",
-           (unsigned)ret, esp_err_to_name((esp_err_t)ret));
-  } else if (err != ESP_OK) {
-    printf("Internal error: %s\n", esp_err_to_name(err));
+  int ret = 0;
+  esp_err_t e = esp_console_run(p, &ret);
+
+  if (e == ESP_ERR_NOT_FOUND) {
+    out_printfln("Unrecognized command");
+  } else if (e == ESP_ERR_INVALID_ARG) {
+    // empty
+  } else if (e == ESP_OK && ret != ESP_OK) {
+    out_printfln("cmd error: 0x%x", (unsigned)ret);
+  } else if (e != ESP_OK) {
+    out_printfln("internal error: %s", esp_err_to_name(e));
   }
 
   delay(1);
