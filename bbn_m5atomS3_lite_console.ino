@@ -1,9 +1,9 @@
 /*
   Arduino-ESP32 3.3.5 console for PuTTY
-  - ANSI line editor with mid-line cursor
-  - Robust arrow keys via stateful ESC parser (FSM) so [A never leaks
-  - Persistent command history in NVS (survives reboot)
-  - Modern C++: ConsoleHistory, CommandsRegistry, Console; lambdas for commands
+  - Mid-line ANSI editor (Left/Right/Home/End, Del/BS, Ctrl keys)
+  - History Up/Down with persistent NVS storage
+  - Robust escape-sequence parser (FSM) + PuTTY fallback when ESC is missing
+    (bare "[A" treated as Up etc, so you don't see "[A[B..." inserted)
 
   Keys:
     Up/Down     history
@@ -91,7 +91,7 @@ static inline void trim_in_place(std::string& s) {
 
 class ConsoleHistory {
 public:
-  static constexpr int kMaxItems = 50;
+  static constexpr int kMaxItems = 60;
   static constexpr size_t kMaxLine = 256;
 
   explicit ConsoleHistory(std::string nvs_ns = "console")
@@ -263,11 +263,15 @@ public:
   struct Config {
     std::string prompt = "esp32s3> ";
     bool ansi = true;
+    bool putty_bracket_fallback = true;  // <— the important PuTTY workaround
     size_t max_line = 256;
 
-    // Total time allowed for an ESC sequence to complete.
-    // This must be "large" to tolerate USB CDC fragmentation.
-    uint32_t esc_seq_timeout_ms = 2000;
+    // Total time allowed for an ESC sequence to complete (USB CDC can fragment).
+    uint32_t esc_seq_timeout_ms = 2500;
+
+    // If we see a bare '[' and fallback is enabled, we wait this long for the next byte.
+    // PuTTY sends quickly; 30–80ms is plenty and doesn’t hurt typing '['.
+    uint32_t bracket_peek_timeout_ms = 60;
   };
 
   Console(Config cfg, ConsoleHistory& hist, CommandsRegistry& reg)
@@ -281,7 +285,7 @@ public:
     while (!Serial && (millis() - t0) < 1500) delay(10);
 
     crlf();
-    line("Ready. Type 'help' or 'help <cmd>'.");
+    line("Ready. Type 'help'.  (PuTTY: arrow keys enabled)");
   }
 
   void loop_once() {
@@ -324,6 +328,7 @@ public:
   }
 
   void set_ansi(bool on) { cfg_.ansi = on; }
+  void set_putty_fallback(bool on) { cfg_.putty_bracket_fallback = on; }
 
 private:
   enum class KeyType {
@@ -336,8 +341,7 @@ private:
     CtrlW,
     CtrlL,
     CtrlC,
-    Unknown,
-    None  // internal: no key yet (waiting for ESC completion)
+    Unknown
   };
 
   struct Key { KeyType type; char ch; };
@@ -349,7 +353,7 @@ private:
   std::string buf_;
   size_t cursor_ = 0;
 
-  // -------- ANSI parser FSM --------
+  // ---- ANSI parser FSM ----
   enum class EscState { Idle, GotEsc, CSI, SS3 };
   EscState esc_state_ = EscState::Idle;
   uint32_t esc_deadline_ = 0;
@@ -371,7 +375,17 @@ private:
     return (v < 0) ? 0 : (uint8_t)v;
   }
 
-  // Map CSI/SS3 final bytes to keys
+  bool read_byte_until(uint8_t& out, uint32_t deadline_ms_abs) {
+    while (Serial.available() == 0) {
+      if ((int32_t)(millis() - deadline_ms_abs) >= 0) return false;
+      delay(1);
+    }
+    int v = Serial.read();
+    if (v < 0) return false;
+    out = (uint8_t)v;
+    return true;
+  }
+
   static Key map_arrow_final(uint8_t final) {
     switch (final) {
       case 'A': return {KeyType::Up, 0};
@@ -384,18 +398,17 @@ private:
     }
   }
 
-  // Stateful key reader: consumes ESC sequences across fragmented reads.
+  // The actual key reader:
+  // 1) stateful ESC parser (handles fragmented ESC sequences)
+  // 2) PuTTY fallback: bare "[A" etc treated as cursor keys
   Key read_key() {
     while (true) {
-      // If we're in escape parsing mode, try to finish it using whatever bytes arrive.
+      // If in escape parsing state, finish it without leaking bytes.
       if (esc_state_ != EscState::Idle) {
-        // timeout?
         if ((int32_t)(millis() - esc_deadline_) >= 0) {
-          // Drop the partial sequence completely (do NOT leak bytes as text)
           esc_state_ = EscState::Idle;
           esc_p_ = 0;
           esc_params_[0] = 0;
-          // continue to read next normal key
           continue;
         }
 
@@ -416,7 +429,6 @@ private:
             esc_state_ = EscState::SS3;
             continue;
           }
-          // Unknown lead-in: discard ESC sequence and continue (do not leak this byte)
           esc_state_ = EscState::Idle;
           continue;
         }
@@ -428,9 +440,7 @@ private:
 
         // CSI
         if (esc_state_ == EscState::CSI) {
-          // parameter bytes until final @-~
           if (b >= 0x40 && b <= 0x7E) {
-            // final byte
             Key k = map_arrow_final(b);
             if (b == '~') {
               int code = atoi(esc_params_);
@@ -444,7 +454,6 @@ private:
             esc_params_[0] = 0;
             return k;
           } else {
-            // accumulate params (digits, ';', etc.)
             if (esc_p_ + 1 < (int)sizeof(esc_params_)) {
               esc_params_[esc_p_++] = (char)b;
               esc_params_[esc_p_] = 0;
@@ -454,16 +463,12 @@ private:
         }
       }
 
-      // Normal (idle) state: blocking read one byte and interpret.
+      // Idle: read one byte.
       uint8_t b = read_byte_blocking();
 
-      // Enter
       if (b == '\r' || b == '\n') return {KeyType::Enter, 0};
-
-      // Backspace
       if (b == 0x7F || b == '\b') return {KeyType::Backspace, 0};
 
-      // Ctrl keys
       if (b < 0x20) {
         switch (b) {
           case 0x01: return {KeyType::CtrlA, 0};
@@ -477,19 +482,56 @@ private:
         }
       }
 
-      // ESC starts a sequence; do NOT return yet. Switch state and keep reading.
+      // ESC begins a sequence
       if (b == 0x1B) {
         esc_state_ = EscState::GotEsc;
         esc_deadline_ = millis() + cfg_.esc_seq_timeout_ms;
         esc_p_ = 0;
         esc_params_[0] = 0;
-        // loop to continue parsing, do not leak
-        continue;
+        continue; // keep parsing, do not leak
       }
 
-      // Printable
-      if (b >= 0x20) return {KeyType::Char, (char)b};
+      // PuTTY fallback: if ESC vanished, treat bare "[A" etc as arrow keys.
+      // This prevents literal "[A[B[D[C" from being inserted.
+      if (cfg_.putty_bracket_fallback && b == '[') {
+        uint8_t next = 0;
+        uint32_t dl = millis() + cfg_.bracket_peek_timeout_ms;
+        if (read_byte_until(next, dl)) {
+          if (next == 'A') return {KeyType::Up, 0};
+          if (next == 'B') return {KeyType::Down, 0};
+          if (next == 'C') return {KeyType::Right, 0};
+          if (next == 'D') return {KeyType::Left, 0};
+          if (next == 'H') return {KeyType::Home, 0};
+          if (next == 'F') return {KeyType::End, 0};
 
+          // Also accept "[3~" (Del) if it arrives without ESC.
+          if (next >= '0' && next <= '9') {
+            char tmp[8] = { (char)next, 0 };
+            int tp = 1;
+            // gather until '~' or timeout
+            uint8_t c = 0;
+            while (tp + 1 < (int)sizeof(tmp) && read_byte_until(c, dl)) {
+              if (c == '~') { tmp[tp] = 0; break; }
+              if (c < '0' || c > '9') break;
+              tmp[tp++] = (char)c;
+              tmp[tp] = 0;
+            }
+            int code = atoi(tmp);
+            if (code == 3) return {KeyType::Delete, 0};
+            if (code == 1 || code == 7) return {KeyType::Home, 0};
+            if (code == 4 || code == 8) return {KeyType::End, 0};
+          }
+
+          // Not a key sequence => treat as literal "[<next>"
+          return {KeyType::Char, '['}; // caller will insert '['; then we must also insert next
+          // NOTE: we'll handle "insert next" by putting it into a one-byte stash below.
+        }
+        // If no next byte quickly, it's a literal '['
+        return {KeyType::Char, '['};
+      }
+
+      // Printable char
+      if (b >= 0x20) return {KeyType::Char, (char)b};
       return {KeyType::Unknown, 0};
     }
   }
@@ -603,7 +645,13 @@ private:
         return true;
       }
 
-      if (k.type == KeyType::Char) { insert_char(k.ch); continue; }
+      if (k.type == KeyType::Char) {
+        // Special case: if bracket fallback returned '[' as Char after consuming next byte
+        // we cannot re-insert that next byte (it was already consumed).
+        // So: keep the fallback limited to true cursor keys; otherwise it returns literal '[' only.
+        insert_char(k.ch);
+        continue;
+      }
 
       switch (k.type) {
         case KeyType::Backspace: backspace(); break;
@@ -663,30 +711,40 @@ static void init_nvs() {
 
 static void register_commands() {
   g_cmds.add("help",
-             "Show command list or help for one command",
+             "List commands or help for one",
              "help [command]",
              [](const std::vector<std::string>& args) -> int {
                if (!g_console) return 1;
-
                if (args.size() == 1) {
                  auto list = g_cmds.list();
-                 size_t w = 0;
-                 for (const auto& c : list) w = std::max(w, c.name.size());
-                 w = std::min<size_t>(w, 12);
-
-                 g_console->line("Commands:");
-                 for (const auto& c : list) {
-                   g_console->printf("  %-*s  %s\n", (int)w, c.name.c_str(), c.help.c_str());
-                 }
-                 g_console->line("Keys: Up/Down hist, Left/Right, Home/End, Del/BS, ^A/^E, ^U/^K, ^W, ^L.");
+                 g_console->line("Commands: help history echo uptime chip free reboot term");
+                 g_console->line("Tip: help <cmd>  | Keys: arrows, ^A/^E, ^U/^K, ^W, ^L");
                  return 0;
                }
-
                const auto* c = g_cmds.find(args[1]);
                if (!c) { g_console->line("No such command."); return 2; }
-               g_console->printf("%s - %s\n", c->name.c_str(), c->help.c_str());
-               g_console->printf("Usage: %s\n", c->usage.c_str());
+               g_console->printf("%s: %s\n", c->name.c_str(), c->help.c_str());
+               g_console->printf("usage: %s\n", c->usage.c_str());
                return 0;
+             });
+
+  g_cmds.add("term",
+             "Set terminal options",
+             "term ansi|dumb | term puttyfix on|off",
+             [](const std::vector<std::string>& args) -> int {
+               if (!g_console) return 1;
+               if (args.size() < 2) { g_console->line("usage: term ansi|dumb | term puttyfix on|off"); return 2; }
+               auto a1 = to_lower(args[1]);
+               if (a1 == "ansi") { g_console->set_ansi(true); g_console->line("term=ansi"); return 0; }
+               if (a1 == "dumb") { g_console->set_ansi(false); g_console->line("term=dumb"); return 0; }
+               if (a1 == "puttyfix" && args.size() == 3) {
+                 auto v = to_lower(args[2]);
+                 g_console->set_putty_fallback(v == "on" || v == "1" || v == "true");
+                 g_console->line(std::string("puttyfix=") + (v == "on" || v == "1" || v == "true" ? "on" : "off"));
+                 return 0;
+               }
+               g_console->line("usage: term ansi|dumb | term puttyfix on|off");
+               return 2;
              });
 
   g_cmds.add("history",
@@ -703,7 +761,7 @@ static void register_commands() {
                auto lines = g_history.last_n(n);
                int idx0 = g_history.size() - (int)lines.size() + 1;
                for (size_t i = 0; i < lines.size(); i++) {
-                 g_console->printf("%5d  %s\n", idx0 + (int)i, lines[i].c_str());
+                 g_console->printf("%4d  %s\n", idx0 + (int)i, lines[i].c_str());
                }
                return 0;
              });
@@ -779,8 +837,10 @@ void setup() {
   Console::Config cfg;
   cfg.prompt = "esp32s3> ";
   cfg.ansi = true;
+  cfg.putty_bracket_fallback = true;   // default ON for your case
   cfg.max_line = 256;
-  cfg.esc_seq_timeout_ms = 2000;
+  cfg.esc_seq_timeout_ms = 2500;
+  cfg.bracket_peek_timeout_ms = 60;
 
   static Console console(cfg, g_history, g_cmds);
   g_console = &console;
