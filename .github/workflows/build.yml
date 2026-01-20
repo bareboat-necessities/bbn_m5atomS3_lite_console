@@ -22,7 +22,7 @@ jobs:
         required-libraries: M5Unified@0.2.11
         sketch-names: "*.ino"
         sketch-names-find-start: bbn_*
-        build-properties: '{ "All": "-DCONFIG_ESP_CONSOLE_USB_CDC=1 -DCONFIG_LIBC_STDOUT_LINE_ENDING_CRLF=1 -DCONFIG_LIBC_STDIN_LINE_ENDING_CR=1" }'
+        build-properties: '{ "All": "-DAPP_CONSOLE=1" }'
         extra-arduino-cli-args: '--warnings default --build-property compiler.libraries.ldflags=-Wl,--allow-multiple-definition '
         set-build-path: true
 
