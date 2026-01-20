@@ -3,8 +3,6 @@ Console on esp32 example
 
 ## Console
 
-Console unfortunately works only on UART. USB CDC and other OTG modes support in Arduino IDE would't work.
-While IDF supports it, it requires whole recompilation of IDF esp32 libraries with different options.
-And Arduino IDE doesn't support it. So console via regular USB you connect your esp32 doesn't work as of now.
+Arduino Release v3.3.5 based on ESP-IDF v5.5.1+ with USB CDC boot and Hardware CDC.
 
-You would need USB to UART TTL adapter with CH340 chip or similar. 
+
