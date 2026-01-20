@@ -1,8 +1,8 @@
 /*
-  Arduino-ESP32 3.3.5 + PuTTY console
-  - Robust ANSI line editor (mid-line cursor)
-  - Up/Down history works (PuTTY sends ESC [ A / ESC [ B, sometimes ESC O A / ESC O B)
-  - Persistent history in NVS (survives reboot)
+  Arduino-ESP32 3.3.5 console for PuTTY
+  - ANSI line editor with mid-line cursor
+  - Robust arrow keys via stateful ESC parser (FSM) so [A never leaks
+  - Persistent command history in NVS (survives reboot)
   - Modern C++: ConsoleHistory, CommandsRegistry, Console; lambdas for commands
 
   Keys:
@@ -50,14 +50,14 @@ static inline std::string to_lower(std::string s) {
   return s;
 }
 
-// Simple argv split: quotes "..." and backslash escapes.
+// argv split: quotes "..." and backslash escapes.
 static std::vector<std::string> split_argv(const std::string& line) {
   std::vector<std::string> out;
   std::string cur;
   bool in_quotes = false;
   bool esc = false;
 
-  auto push = [&](){
+  auto push = [&]() {
     if (!cur.empty()) out.push_back(cur);
     cur.clear();
   };
@@ -230,7 +230,8 @@ public:
       if (x.name == c.name) { x = std::move(c); return; }
     }
     cmds_.push_back(std::move(c));
-    std::sort(cmds_.begin(), cmds_.end(), [](const Command& a, const Command& b){ return a.name < b.name; });
+    std::sort(cmds_.begin(), cmds_.end(),
+              [](const Command& a, const Command& b){ return a.name < b.name; });
   }
 
   const Command* find(const std::string& name) const {
@@ -264,9 +265,9 @@ public:
     bool ansi = true;
     size_t max_line = 256;
 
-    // Critical: large enough so ESC + rest never gets split into literal "[A".
-    // We consume the entire escape sequence before returning.
-    uint32_t esc_total_timeout_ms = 1200;
+    // Total time allowed for an ESC sequence to complete.
+    // This must be "large" to tolerate USB CDC fragmentation.
+    uint32_t esc_seq_timeout_ms = 2000;
   };
 
   Console(Config cfg, ConsoleHistory& hist, CommandsRegistry& reg)
@@ -292,7 +293,7 @@ public:
 
     hist_.add(in);
 
-    crlf(); // start output on clean line
+    crlf();
     int rc = reg_.run_line(in);
     if (rc == CommandsRegistry::err_not_found) {
       line("Unknown command. Type 'help'.");
@@ -323,7 +324,6 @@ public:
   }
 
   void set_ansi(bool on) { cfg_.ansi = on; }
-  bool ansi() const { return cfg_.ansi; }
 
 private:
   enum class KeyType {
@@ -336,7 +336,8 @@ private:
     CtrlW,
     CtrlL,
     CtrlC,
-    Unknown
+    Unknown,
+    None  // internal: no key yet (waiting for ESC completion)
   };
 
   struct Key { KeyType type; char ch; };
@@ -348,120 +349,156 @@ private:
   std::string buf_;
   size_t cursor_ = 0;
 
-  // ---- serial primitives ----
-  int read_byte_blocking() {
-    while (Serial.available() == 0) delay(1);
-    return Serial.read();
-  }
+  // -------- ANSI parser FSM --------
+  enum class EscState { Idle, GotEsc, CSI, SS3 };
+  EscState esc_state_ = EscState::Idle;
+  uint32_t esc_deadline_ = 0;
+  char esc_params_[24] = {0};
+  int esc_p_ = 0;
 
-  bool read_byte_until(uint8_t& out, uint32_t deadline_ms_abs) {
-    while (Serial.available() == 0) {
-      if ((int32_t)(millis() - deadline_ms_abs) >= 0) return false;
-      delay(1);
-    }
+  // ---- serial primitives ----
+  bool read_byte_nonblocking(uint8_t& out) {
+    if (Serial.available() == 0) return false;
     int v = Serial.read();
     if (v < 0) return false;
     out = (uint8_t)v;
     return true;
   }
 
-  // ---- robust escape reader: always consumes full sequence ----
-  //
-  // This is the core fix: after ESC, we keep consuming bytes until we see a
-  // final byte or hit the total deadline. We never "give up early" and leak
-  // '[' 'A' into the normal text path.
-  //
-  Key read_key() {
-    int v = read_byte_blocking();
-    if (v < 0) return {KeyType::Unknown, 0};
-    uint8_t b = (uint8_t)v;
+  uint8_t read_byte_blocking() {
+    while (Serial.available() == 0) delay(1);
+    int v = Serial.read();
+    return (v < 0) ? 0 : (uint8_t)v;
+  }
 
-    if (b == '\r' || b == '\n') return {KeyType::Enter, 0};
-    if (b == 0x7F || b == '\b') return {KeyType::Backspace, 0};
-
-    if (b < 0x20) {
-      switch (b) {
-        case 0x01: return {KeyType::CtrlA, 0};
-        case 0x05: return {KeyType::CtrlE, 0};
-        case 0x15: return {KeyType::CtrlU, 0};
-        case 0x0B: return {KeyType::CtrlK, 0};
-        case 0x17: return {KeyType::CtrlW, 0};
-        case 0x0C: return {KeyType::CtrlL, 0};
-        case 0x03: return {KeyType::CtrlC, 0};
-        default:   return {KeyType::Unknown, 0};
-      }
+  // Map CSI/SS3 final bytes to keys
+  static Key map_arrow_final(uint8_t final) {
+    switch (final) {
+      case 'A': return {KeyType::Up, 0};
+      case 'B': return {KeyType::Down, 0};
+      case 'C': return {KeyType::Right, 0};
+      case 'D': return {KeyType::Left, 0};
+      case 'H': return {KeyType::Home, 0};
+      case 'F': return {KeyType::End, 0};
+      default:  return {KeyType::Unknown, 0};
     }
+  }
 
-    if (b == 0x1B) {
-      const uint32_t deadline = millis() + cfg_.esc_total_timeout_ms;
-
-      uint8_t b1 = 0;
-      if (!read_byte_until(b1, deadline)) return {KeyType::Unknown, 0};
-
-      // CSI: ESC [
-      if (b1 == '[') {
-        // Capture parameter bytes so we can decode ~ codes (Delete/Home/End) too.
-        char params[24] = {0};
-        int p = 0;
-
-        uint8_t c = 0;
-        while (true) {
-          if (!read_byte_until(c, deadline)) return {KeyType::Unknown, 0};
-
-          // final byte @-~
-          if (c >= 0x40 && c <= 0x7E) break;
-
-          if (p + 1 < (int)sizeof(params)) params[p++] = (char)c;
+  // Stateful key reader: consumes ESC sequences across fragmented reads.
+  Key read_key() {
+    while (true) {
+      // If we're in escape parsing mode, try to finish it using whatever bytes arrive.
+      if (esc_state_ != EscState::Idle) {
+        // timeout?
+        if ((int32_t)(millis() - esc_deadline_) >= 0) {
+          // Drop the partial sequence completely (do NOT leak bytes as text)
+          esc_state_ = EscState::Idle;
+          esc_p_ = 0;
+          esc_params_[0] = 0;
+          // continue to read next normal key
+          continue;
         }
 
-        // Arrow keys (even with modifiers like "1;5A")
-        if (c == 'A') return {KeyType::Up, 0};
-        if (c == 'B') return {KeyType::Down, 0};
-        if (c == 'C') return {KeyType::Right, 0};
-        if (c == 'D') return {KeyType::Left, 0};
-        if (c == 'H') return {KeyType::Home, 0};
-        if (c == 'F') return {KeyType::End, 0};
-
-        // Tilde codes: [3~ (del), [1~ home, [4~ end, [7~ home, [8~ end)
-        if (c == '~') {
-          int code = atoi(params);
-          if (code == 3) return {KeyType::Delete, 0};
-          if (code == 1 || code == 7) return {KeyType::Home, 0};
-          if (code == 4 || code == 8) return {KeyType::End, 0};
+        uint8_t b;
+        if (!read_byte_nonblocking(b)) {
+          delay(1);
+          continue;
         }
 
-        return {KeyType::Unknown, 0};
+        if (esc_state_ == EscState::GotEsc) {
+          if (b == '[') {
+            esc_state_ = EscState::CSI;
+            esc_p_ = 0;
+            esc_params_[0] = 0;
+            continue;
+          }
+          if (b == 'O') {
+            esc_state_ = EscState::SS3;
+            continue;
+          }
+          // Unknown lead-in: discard ESC sequence and continue (do not leak this byte)
+          esc_state_ = EscState::Idle;
+          continue;
+        }
+
+        if (esc_state_ == EscState::SS3) {
+          esc_state_ = EscState::Idle;
+          return map_arrow_final(b);
+        }
+
+        // CSI
+        if (esc_state_ == EscState::CSI) {
+          // parameter bytes until final @-~
+          if (b >= 0x40 && b <= 0x7E) {
+            // final byte
+            Key k = map_arrow_final(b);
+            if (b == '~') {
+              int code = atoi(esc_params_);
+              if (code == 3) k = {KeyType::Delete, 0};
+              else if (code == 1 || code == 7) k = {KeyType::Home, 0};
+              else if (code == 4 || code == 8) k = {KeyType::End, 0};
+              else k = {KeyType::Unknown, 0};
+            }
+            esc_state_ = EscState::Idle;
+            esc_p_ = 0;
+            esc_params_[0] = 0;
+            return k;
+          } else {
+            // accumulate params (digits, ';', etc.)
+            if (esc_p_ + 1 < (int)sizeof(esc_params_)) {
+              esc_params_[esc_p_++] = (char)b;
+              esc_params_[esc_p_] = 0;
+            }
+            continue;
+          }
+        }
       }
 
-      // SS3: ESC O (some PuTTY modes)
-      if (b1 == 'O') {
-        uint8_t c = 0;
-        if (!read_byte_until(c, deadline)) return {KeyType::Unknown, 0};
-        if (c == 'A') return {KeyType::Up, 0};
-        if (c == 'B') return {KeyType::Down, 0};
-        if (c == 'C') return {KeyType::Right, 0};
-        if (c == 'D') return {KeyType::Left, 0};
-        if (c == 'H') return {KeyType::Home, 0};
-        if (c == 'F') return {KeyType::End, 0};
-        return {KeyType::Unknown, 0};
+      // Normal (idle) state: blocking read one byte and interpret.
+      uint8_t b = read_byte_blocking();
+
+      // Enter
+      if (b == '\r' || b == '\n') return {KeyType::Enter, 0};
+
+      // Backspace
+      if (b == 0x7F || b == '\b') return {KeyType::Backspace, 0};
+
+      // Ctrl keys
+      if (b < 0x20) {
+        switch (b) {
+          case 0x01: return {KeyType::CtrlA, 0};
+          case 0x05: return {KeyType::CtrlE, 0};
+          case 0x15: return {KeyType::CtrlU, 0};
+          case 0x0B: return {KeyType::CtrlK, 0};
+          case 0x17: return {KeyType::CtrlW, 0};
+          case 0x0C: return {KeyType::CtrlL, 0};
+          case 0x03: return {KeyType::CtrlC, 0};
+          default:   return {KeyType::Unknown, 0};
+        }
       }
 
-      // Unknown ESC lead-in: consume a little more if it looks like a sequence,
-      // but do not leak bytes as text.
-      // (We already consumed b1.)
+      // ESC starts a sequence; do NOT return yet. Switch state and keep reading.
+      if (b == 0x1B) {
+        esc_state_ = EscState::GotEsc;
+        esc_deadline_ = millis() + cfg_.esc_seq_timeout_ms;
+        esc_p_ = 0;
+        esc_params_[0] = 0;
+        // loop to continue parsing, do not leak
+        continue;
+      }
+
+      // Printable
+      if (b >= 0x20) return {KeyType::Char, (char)b};
+
       return {KeyType::Unknown, 0};
     }
-
-    // Printable
-    if (b >= 0x20) return {KeyType::Char, (char)b};
-    return {KeyType::Unknown, 0};
   }
 
   // ---- editor render ----
   void redraw() {
     if (!cfg_.ansi) return;
     Serial.write('\r');
-    Serial.write("\x1b[2K"); // clear line
+    Serial.write("\x1b[2K");
     Serial.print(cfg_.prompt.c_str());
     if (!buf_.empty()) Serial.write((const uint8_t*)buf_.data(), buf_.size());
     const size_t back = buf_.size() - cursor_;
@@ -604,14 +641,13 @@ private:
           break;
 
         default:
-          // Ignore unknown (important: we already consumed ESC sequences so nothing leaks)
           break;
       }
     }
   }
 };
 
-// ------------------------------ Wiring (globals) ------------------------------
+// ------------------------------ wiring ------------------------------
 
 static ConsoleHistory g_history("console");
 static CommandsRegistry g_cmds;
@@ -642,7 +678,7 @@ static void register_commands() {
                  for (const auto& c : list) {
                    g_console->printf("  %-*s  %s\n", (int)w, c.name.c_str(), c.help.c_str());
                  }
-                 g_console->line("Editor: Up/Down hist, Left/Right, Home/End, Del/BS, ^A/^E, ^U/^K, ^W, ^L.");
+                 g_console->line("Keys: Up/Down hist, Left/Right, Home/End, Del/BS, ^A/^E, ^U/^K, ^W, ^L.");
                  return 0;
                }
 
@@ -651,19 +687,6 @@ static void register_commands() {
                g_console->printf("%s - %s\n", c->name.c_str(), c->help.c_str());
                g_console->printf("Usage: %s\n", c->usage.c_str());
                return 0;
-             });
-
-  g_cmds.add("term",
-             "Set terminal mode",
-             "term ansi|dumb",
-             [](const std::vector<std::string>& args) -> int {
-               if (!g_console) return 1;
-               if (args.size() != 2) { g_console->line("Usage: term ansi|dumb"); return 2; }
-               auto m = to_lower(args[1]);
-               if (m == "ansi") { g_console->set_ansi(true); g_console->line("term=ansi"); return 0; }
-               if (m == "dumb") { g_console->set_ansi(false); g_console->line("term=dumb"); return 0; }
-               g_console->line("Usage: term ansi|dumb");
-               return 2;
              });
 
   g_cmds.add("history",
@@ -748,8 +771,6 @@ static void register_commands() {
              });
 }
 
-// ------------------------------ Arduino entrypoints ------------------------------
-
 void setup() {
   init_nvs();
   (void)g_history.load();
@@ -759,7 +780,7 @@ void setup() {
   cfg.prompt = "esp32s3> ";
   cfg.ansi = true;
   cfg.max_line = 256;
-  cfg.esc_total_timeout_ms = 1200;  // big, to prevent ESC split/leak
+  cfg.esc_seq_timeout_ms = 2000;
 
   static Console console(cfg, g_history, g_cmds);
   g_console = &console;
