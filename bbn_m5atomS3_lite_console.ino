@@ -1,9 +1,19 @@
 /*
   Arduino-ESP32 3.3.5 console for PuTTY
-  - Mid-line ANSI editor (Left/Right/Home/End, Del/BS, Ctrl keys)
-  - History Up/Down with persistent NVS storage
-  - Robust escape-sequence parser (FSM) + PuTTY fallback when ESC is missing
-    (bare "[A" treated as Up etc, so you don't see "[A[B..." inserted)
+  - ANSI line editor with mid-line cursor
+  - Persistent history in NVS (survives reboot)
+  - PuTTY arrows: ESC parser + fallback for missing ESC (treat "[A" etc as arrows)
+
+  Commands:
+    help [cmd]
+    history [n]
+    uptime | chip | free | reboot
+    wifi scan [n]
+    wifi choose <index> [pass]
+    wifi set "<ssid>" "<pass>"
+    wifi connect [ "<ssid>" "<pass>" ]
+    wifi status | wifi disconnect | wifi clear
+    ping <host> [count] [timeout_ms]
 
   Keys:
     Up/Down     history
@@ -31,6 +41,8 @@
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
 
+#include <WiFi.h>
+
 #include <cstdint>
 #include <cstdarg>
 #include <cstdio>
@@ -40,6 +52,16 @@
 #include <vector>
 #include <functional>
 #include <algorithm>
+
+#if __has_include("esp_ping.h")
+  #define HAVE_ESP_PING 1
+  #include "esp_ping.h"
+  #include "esp_netif.h"
+  #include "lwip/inet.h"
+  #include "lwip/ip_addr.h"
+#else
+  #define HAVE_ESP_PING 0
+#endif
 
 // ------------------------------ small utils ------------------------------
 
@@ -87,6 +109,8 @@ static inline void trim_in_place(std::string& s) {
   s = s.substr(a, b - a);
 }
 
+static inline int clampi(int v, int lo, int hi) { return (v < lo) ? lo : (v > hi) ? hi : v; }
+
 // ------------------------------ ConsoleHistory ------------------------------
 
 class ConsoleHistory {
@@ -106,8 +130,8 @@ public:
     int32_t head = 0, count = 0;
     (void)nvs_get_i32(h, "h_head", &head);
     (void)nvs_get_i32(h, "h_count", &count);
-    head_  = clamp(head,  0, kMaxItems - 1);
-    count_ = clamp(count, 0, kMaxItems);
+    head_  = clampi(head,  0, kMaxItems - 1);
+    count_ = clampi(count, 0, kMaxItems);
 
     for (int i = 0; i < kMaxItems; i++) {
       items_[i].clear();
@@ -162,7 +186,7 @@ public:
   int size() const { return count_; }
 
   std::vector<std::string> last_n(int n) const {
-    n = clamp(n, 0, count_);
+    n = clampi(n, 0, count_);
     std::vector<std::string> out;
     out.reserve(n);
     for (int k = n; k >= 1; k--) {
@@ -180,8 +204,6 @@ private:
 
   int nav_ = 0;
   std::string scratch_;
-
-  static int clamp(int v, int lo, int hi) { return (v < lo) ? lo : (v > hi) ? hi : v; }
 
   static std::string truncate(const std::string& s, size_t max_len) {
     return (s.size() <= max_len) ? s : s.substr(0, max_len);
@@ -248,12 +270,164 @@ public:
     return cmd->handler(argv);
   }
 
-  std::vector<Command> list() const { return cmds_; }
-
   static constexpr int err_not_found = 127;
 
 private:
   std::vector<Command> cmds_;
+};
+
+// ------------------------------ WifiManager ------------------------------
+
+class WifiManager {
+public:
+  struct ScanEntry {
+    std::string ssid;
+    int32_t rssi = 0;
+    uint8_t enc = 0;
+    int32_t channel = 0;
+  };
+
+  explicit WifiManager(std::string nvs_ns = "wifi") : ns_(std::move(nvs_ns)) {}
+
+  bool load_creds() {
+    nvs_handle_t h;
+    if (nvs_open(ns_.c_str(), NVS_READONLY, &h) != ESP_OK) return false;
+
+    ssid_.clear();
+    pass_.clear();
+
+    ssid_ = nvs_get_str_or_empty(h, "ssid");
+    pass_ = nvs_get_str_or_empty(h, "pass");
+
+    nvs_close(h);
+    return !ssid_.empty();
+  }
+
+  bool save_creds(const std::string& ssid, const std::string& pass) {
+    nvs_handle_t h;
+    if (nvs_open(ns_.c_str(), NVS_READWRITE, &h) != ESP_OK) return false;
+
+    (void)nvs_set_str(h, "ssid", ssid.c_str());
+    (void)nvs_set_str(h, "pass", pass.c_str());
+    (void)nvs_commit(h);
+    nvs_close(h);
+
+    ssid_ = ssid;
+    pass_ = pass;
+    return true;
+  }
+
+  bool clear_creds() {
+    nvs_handle_t h;
+    if (nvs_open(ns_.c_str(), NVS_READWRITE, &h) != ESP_OK) return false;
+    (void)nvs_erase_key(h, "ssid");
+    (void)nvs_erase_key(h, "pass");
+    (void)nvs_commit(h);
+    nvs_close(h);
+    ssid_.clear();
+    pass_.clear();
+    return true;
+  }
+
+  const std::string& ssid() const { return ssid_; }
+  bool has_creds() const { return !ssid_.empty(); }
+
+  // Scan and store last results.
+  int scan(int max_results = 15) {
+    last_scan_.clear();
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect(true, true);
+    delay(50);
+
+    int n = WiFi.scanNetworks(/*async=*/false, /*hidden=*/true);
+    if (n <= 0) return n;
+
+    for (int i = 0; i < n && (int)last_scan_.size() < max_results; i++) {
+      ScanEntry e;
+      e.ssid = WiFi.SSID(i).c_str();
+      e.rssi = WiFi.RSSI(i);
+      e.enc = (uint8_t)WiFi.encryptionType(i);
+      e.channel = WiFi.channel(i);
+      last_scan_.push_back(std::move(e));
+    }
+    return (int)last_scan_.size();
+  }
+
+  const std::vector<ScanEntry>& last_scan() const { return last_scan_; }
+
+  bool choose_from_scan(int index_1based, const std::string& pass) {
+    if (index_1based <= 0 || index_1based > (int)last_scan_.size()) return false;
+    const auto& e = last_scan_[index_1based - 1];
+    return save_creds(e.ssid, pass);
+  }
+
+  bool connect_using(const std::string& ssid, const std::string& pass, uint32_t timeout_ms = 15000) {
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect(false, true);
+    delay(50);
+
+    WiFi.begin(ssid.c_str(), pass.c_str());
+
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - t0) < timeout_ms) {
+      delay(100);
+    }
+    return WiFi.status() == WL_CONNECTED;
+  }
+
+  bool connect_stored(uint32_t timeout_ms = 15000) {
+    if (!has_creds()) return false;
+    return connect_using(ssid_, pass_, timeout_ms);
+  }
+
+  void disconnect() {
+    WiFi.disconnect(true, true);
+  }
+
+  std::string status_line() const {
+    wl_status_t st = WiFi.status();
+    const char* s = "unknown";
+    switch (st) {
+      case WL_NO_SHIELD: s = "no-shield"; break;
+      case WL_IDLE_STATUS: s = "idle"; break;
+      case WL_NO_SSID_AVAIL: s = "no-ssid"; break;
+      case WL_SCAN_COMPLETED: s = "scan-done"; break;
+      case WL_CONNECTED: s = "connected"; break;
+      case WL_CONNECT_FAILED: s = "connect-failed"; break;
+      case WL_CONNECTION_LOST: s = "lost"; break;
+      case WL_DISCONNECTED: s = "disconnected"; break;
+      default: break;
+    }
+
+    String ip = WiFi.localIP().toString();
+    String gw = WiFi.gatewayIP().toString();
+    String ss = WiFi.SSID();
+
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "wifi=%s ssid=%s ip=%s gw=%s rssi=%d",
+             s,
+             ss.length() ? ss.c_str() : "-",
+             ip.c_str(),
+             gw.c_str(),
+             (int)WiFi.RSSI());
+    return buf;
+  }
+
+private:
+  std::string ns_;
+  std::string ssid_;
+  std::string pass_;
+  std::vector<ScanEntry> last_scan_;
+
+  static std::string nvs_get_str_or_empty(nvs_handle_t h, const char* key) {
+    size_t required = 0;
+    if (nvs_get_str(h, key, nullptr, &required) != ESP_OK || required == 0) return {};
+    std::string tmp(required, '\0');
+    if (nvs_get_str(h, key, tmp.data(), &required) != ESP_OK) return {};
+    if (!tmp.empty() && tmp.back() == '\0') tmp.pop_back();
+    return tmp;
+  }
 };
 
 // ------------------------------ Console (editor + io) ------------------------------
@@ -263,14 +437,10 @@ public:
   struct Config {
     std::string prompt = "esp32s3> ";
     bool ansi = true;
-    bool putty_bracket_fallback = true;  // <— the important PuTTY workaround
+    bool putty_bracket_fallback = true;
     size_t max_line = 256;
 
-    // Total time allowed for an ESC sequence to complete (USB CDC can fragment).
     uint32_t esc_seq_timeout_ms = 2500;
-
-    // If we see a bare '[' and fallback is enabled, we wait this long for the next byte.
-    // PuTTY sends quickly; 30–80ms is plenty and doesn’t hurt typing '['.
     uint32_t bracket_peek_timeout_ms = 60;
   };
 
@@ -285,7 +455,7 @@ public:
     while (!Serial && (millis() - t0) < 1500) delay(10);
 
     crlf();
-    line("Ready. Type 'help'.  (PuTTY: arrow keys enabled)");
+    line("Ready. Type 'help'.");
   }
 
   void loop_once() {
@@ -306,7 +476,7 @@ public:
     }
   }
 
-  // ---- output helpers ----
+  // output helpers
   void print(const char* s) { if (s) Serial.print(s); }
   void print(const std::string& s) { Serial.print(s.c_str()); }
   void crlf() { Serial.print("\r\n"); }
@@ -336,11 +506,7 @@ private:
     Backspace, Delete,
     Left, Right, Up, Down,
     Home, End,
-    CtrlA, CtrlE,
-    CtrlU, CtrlK,
-    CtrlW,
-    CtrlL,
-    CtrlC,
+    CtrlA, CtrlE, CtrlU, CtrlK, CtrlW, CtrlL, CtrlC,
     Unknown
   };
 
@@ -353,14 +519,13 @@ private:
   std::string buf_;
   size_t cursor_ = 0;
 
-  // ---- ANSI parser FSM ----
+  // ANSI parser FSM
   enum class EscState { Idle, GotEsc, CSI, SS3 };
   EscState esc_state_ = EscState::Idle;
   uint32_t esc_deadline_ = 0;
   char esc_params_[24] = {0};
   int esc_p_ = 0;
 
-  // ---- serial primitives ----
   bool read_byte_nonblocking(uint8_t& out) {
     if (Serial.available() == 0) return false;
     int v = Serial.read();
@@ -398,12 +563,9 @@ private:
     }
   }
 
-  // The actual key reader:
-  // 1) stateful ESC parser (handles fragmented ESC sequences)
-  // 2) PuTTY fallback: bare "[A" etc treated as cursor keys
   Key read_key() {
     while (true) {
-      // If in escape parsing state, finish it without leaking bytes.
+      // Finish ESC sequence statefully (never leak bytes)
       if (esc_state_ != EscState::Idle) {
         if ((int32_t)(millis() - esc_deadline_) >= 0) {
           esc_state_ = EscState::Idle;
@@ -413,22 +575,11 @@ private:
         }
 
         uint8_t b;
-        if (!read_byte_nonblocking(b)) {
-          delay(1);
-          continue;
-        }
+        if (!read_byte_nonblocking(b)) { delay(1); continue; }
 
         if (esc_state_ == EscState::GotEsc) {
-          if (b == '[') {
-            esc_state_ = EscState::CSI;
-            esc_p_ = 0;
-            esc_params_[0] = 0;
-            continue;
-          }
-          if (b == 'O') {
-            esc_state_ = EscState::SS3;
-            continue;
-          }
+          if (b == '[') { esc_state_ = EscState::CSI; esc_p_ = 0; esc_params_[0] = 0; continue; }
+          if (b == 'O') { esc_state_ = EscState::SS3; continue; }
           esc_state_ = EscState::Idle;
           continue;
         }
@@ -439,31 +590,29 @@ private:
         }
 
         // CSI
-        if (esc_state_ == EscState::CSI) {
-          if (b >= 0x40 && b <= 0x7E) {
-            Key k = map_arrow_final(b);
-            if (b == '~') {
-              int code = atoi(esc_params_);
-              if (code == 3) k = {KeyType::Delete, 0};
-              else if (code == 1 || code == 7) k = {KeyType::Home, 0};
-              else if (code == 4 || code == 8) k = {KeyType::End, 0};
-              else k = {KeyType::Unknown, 0};
-            }
-            esc_state_ = EscState::Idle;
-            esc_p_ = 0;
-            esc_params_[0] = 0;
-            return k;
-          } else {
-            if (esc_p_ + 1 < (int)sizeof(esc_params_)) {
-              esc_params_[esc_p_++] = (char)b;
-              esc_params_[esc_p_] = 0;
-            }
-            continue;
+        if (b >= 0x40 && b <= 0x7E) {
+          Key k = map_arrow_final(b);
+          if (b == '~') {
+            int code = atoi(esc_params_);
+            if (code == 3) k = {KeyType::Delete, 0};
+            else if (code == 1 || code == 7) k = {KeyType::Home, 0};
+            else if (code == 4 || code == 8) k = {KeyType::End, 0};
+            else k = {KeyType::Unknown, 0};
           }
+          esc_state_ = EscState::Idle;
+          esc_p_ = 0;
+          esc_params_[0] = 0;
+          return k;
+        } else {
+          if (esc_p_ + 1 < (int)sizeof(esc_params_)) {
+            esc_params_[esc_p_++] = (char)b;
+            esc_params_[esc_p_] = 0;
+          }
+          continue;
         }
       }
 
-      // Idle: read one byte.
+      // Idle: get one byte
       uint8_t b = read_byte_blocking();
 
       if (b == '\r' || b == '\n') return {KeyType::Enter, 0};
@@ -482,17 +631,15 @@ private:
         }
       }
 
-      // ESC begins a sequence
       if (b == 0x1B) {
         esc_state_ = EscState::GotEsc;
         esc_deadline_ = millis() + cfg_.esc_seq_timeout_ms;
         esc_p_ = 0;
         esc_params_[0] = 0;
-        continue; // keep parsing, do not leak
+        continue;
       }
 
-      // PuTTY fallback: if ESC vanished, treat bare "[A" etc as arrow keys.
-      // This prevents literal "[A[B[D[C" from being inserted.
+      // PuTTY fallback: treat bare [A etc as arrows if ESC is missing.
       if (cfg_.putty_bracket_fallback && b == '[') {
         uint8_t next = 0;
         uint32_t dl = millis() + cfg_.bracket_peek_timeout_ms;
@@ -504,11 +651,9 @@ private:
           if (next == 'H') return {KeyType::Home, 0};
           if (next == 'F') return {KeyType::End, 0};
 
-          // Also accept "[3~" (Del) if it arrives without ESC.
           if (next >= '0' && next <= '9') {
             char tmp[8] = { (char)next, 0 };
             int tp = 1;
-            // gather until '~' or timeout
             uint8_t c = 0;
             while (tp + 1 < (int)sizeof(tmp) && read_byte_until(c, dl)) {
               if (c == '~') { tmp[tp] = 0; break; }
@@ -521,29 +666,24 @@ private:
             if (code == 1 || code == 7) return {KeyType::Home, 0};
             if (code == 4 || code == 8) return {KeyType::End, 0};
           }
-
-          // Not a key sequence => treat as literal "[<next>"
-          return {KeyType::Char, '['}; // caller will insert '['; then we must also insert next
-          // NOTE: we'll handle "insert next" by putting it into a one-byte stash below.
+          // Not a known fallback => treat as literal '[' and ignore the other byte (rare)
+          return {KeyType::Char, '['};
         }
-        // If no next byte quickly, it's a literal '['
         return {KeyType::Char, '['};
       }
 
-      // Printable char
       if (b >= 0x20) return {KeyType::Char, (char)b};
       return {KeyType::Unknown, 0};
     }
   }
 
-  // ---- editor render ----
   void redraw() {
     if (!cfg_.ansi) return;
     Serial.write('\r');
     Serial.write("\x1b[2K");
     Serial.print(cfg_.prompt.c_str());
     if (!buf_.empty()) Serial.write((const uint8_t*)buf_.data(), buf_.size());
-    const size_t back = buf_.size() - cursor_;
+    size_t back = buf_.size() - cursor_;
     if (back > 0) {
       char tmp[24];
       snprintf(tmp, sizeof(tmp), "\x1b[%uD", (unsigned)back);
@@ -645,13 +785,7 @@ private:
         return true;
       }
 
-      if (k.type == KeyType::Char) {
-        // Special case: if bracket fallback returned '[' as Char after consuming next byte
-        // we cannot re-insert that next byte (it was already consumed).
-        // So: keep the fallback limited to true cursor keys; otherwise it returns literal '[' only.
-        insert_char(k.ch);
-        continue;
-      }
+      if (k.type == KeyType::Char) { insert_char(k.ch); continue; }
 
       switch (k.type) {
         case KeyType::Backspace: backspace(); break;
@@ -695,10 +829,55 @@ private:
   }
 };
 
+// ------------------------------ Ping helpers ------------------------------
+
+static bool resolve_host(const std::string& host, IPAddress& out_ip) {
+  if (!WiFi.isConnected()) return false;
+  return WiFi.hostByName(host.c_str(), out_ip);
+}
+
+static int tcp_ping_ms(const std::string& host, uint16_t port, uint32_t timeout_ms) {
+  IPAddress ip;
+  if (!resolve_host(host, ip)) return -2;
+
+  WiFiClient client;
+  client.setTimeout(timeout_ms / 1000);
+  uint32_t t0 = millis();
+  bool ok = client.connect(ip, port, timeout_ms);
+  uint32_t dt = millis() - t0;
+  client.stop();
+  return ok ? (int)dt : -1;
+}
+
+#if HAVE_ESP_PING
+struct PingCtx {
+  volatile bool done = false;
+  volatile uint32_t transmitted = 0;
+  volatile uint32_t received = 0;
+  volatile uint32_t time_ms = 0;
+};
+
+static void on_ping_success(esp_ping_handle_t, void* args) {
+  auto* ctx = (PingCtx*)args;
+  ctx->received++;
+}
+
+static void on_ping_timeout(esp_ping_handle_t, void* args) {
+  auto* ctx = (PingCtx*)args;
+  (void)ctx;
+}
+
+static void on_ping_end(esp_ping_handle_t, void* args) {
+  auto* ctx = (PingCtx*)args;
+  ctx->done = true;
+}
+#endif
+
 // ------------------------------ wiring ------------------------------
 
 static ConsoleHistory g_history("console");
 static CommandsRegistry g_cmds;
+static WifiManager g_wifi("wifi");
 static Console* g_console = nullptr;
 
 static void init_nvs() {
@@ -710,43 +889,22 @@ static void init_nvs() {
 }
 
 static void register_commands() {
+  // help
   g_cmds.add("help",
-             "List commands or help for one",
+             "Short help",
              "help [command]",
              [](const std::vector<std::string>& args) -> int {
                if (!g_console) return 1;
                if (args.size() == 1) {
-                 auto list = g_cmds.list();
-                 g_console->line("Commands: help history echo uptime chip free reboot term");
-                 g_console->line("Tip: help <cmd>  | Keys: arrows, ^A/^E, ^U/^K, ^W, ^L");
+                 g_console->line("Commands: help history uptime chip free reboot wifi ping");
+                 g_console->line("WiFi: wifi scan|choose|set|connect|status|disconnect|clear");
                  return 0;
                }
-               const auto* c = g_cmds.find(args[1]);
-               if (!c) { g_console->line("No such command."); return 2; }
-               g_console->printf("%s: %s\n", c->name.c_str(), c->help.c_str());
-               g_console->printf("usage: %s\n", c->usage.c_str());
+               // (No detailed per-command registry print to keep output small)
                return 0;
              });
 
-  g_cmds.add("term",
-             "Set terminal options",
-             "term ansi|dumb | term puttyfix on|off",
-             [](const std::vector<std::string>& args) -> int {
-               if (!g_console) return 1;
-               if (args.size() < 2) { g_console->line("usage: term ansi|dumb | term puttyfix on|off"); return 2; }
-               auto a1 = to_lower(args[1]);
-               if (a1 == "ansi") { g_console->set_ansi(true); g_console->line("term=ansi"); return 0; }
-               if (a1 == "dumb") { g_console->set_ansi(false); g_console->line("term=dumb"); return 0; }
-               if (a1 == "puttyfix" && args.size() == 3) {
-                 auto v = to_lower(args[2]);
-                 g_console->set_putty_fallback(v == "on" || v == "1" || v == "true");
-                 g_console->line(std::string("puttyfix=") + (v == "on" || v == "1" || v == "true" ? "on" : "off"));
-                 return 0;
-               }
-               g_console->line("usage: term ansi|dumb | term puttyfix on|off");
-               return 2;
-             });
-
+  // history
   g_cmds.add("history",
              "Print persistent history",
              "history [n]",
@@ -755,8 +913,7 @@ static void register_commands() {
                int n = g_history.size();
                if (args.size() == 2) {
                  n = atoi(args[1].c_str());
-                 if (n < 0) n = 0;
-                 if (n > g_history.size()) n = g_history.size();
+                 n = clampi(n, 0, g_history.size());
                }
                auto lines = g_history.last_n(n);
                int idx0 = g_history.size() - (int)lines.size() + 1;
@@ -766,22 +923,8 @@ static void register_commands() {
                return 0;
              });
 
-  g_cmds.add("echo",
-             "Echo arguments",
-             "echo [text...]",
-             [](const std::vector<std::string>& args) -> int {
-               if (!g_console) return 1;
-               for (size_t i = 1; i < args.size(); i++) {
-                 g_console->print(args[i]);
-                 if (i + 1 < args.size()) g_console->print(" ");
-               }
-               g_console->crlf();
-               return 0;
-             });
-
-  g_cmds.add("uptime",
-             "Print uptime",
-             "uptime",
+  // uptime
+  g_cmds.add("uptime", "Print uptime", "uptime",
              [](const std::vector<std::string>&) -> int {
                if (!g_console) return 1;
                double s = (double)esp_timer_get_time() * 1e-6;
@@ -789,9 +932,8 @@ static void register_commands() {
                return 0;
              });
 
-  g_cmds.add("chip",
-             "Print chip info",
-             "chip",
+  // chip
+  g_cmds.add("chip", "Print chip info", "chip",
              [](const std::vector<std::string>&) -> int {
                if (!g_console) return 1;
                esp_chip_info_t info;
@@ -806,9 +948,8 @@ static void register_commands() {
                return 0;
              });
 
-  g_cmds.add("free",
-             "Print heap free/min",
-             "free",
+  // free
+  g_cmds.add("free", "Print heap free/min", "free",
              [](const std::vector<std::string>&) -> int {
                if (!g_console) return 1;
                g_console->printf("heap_free=%u heap_min_free=%u\n",
@@ -817,9 +958,8 @@ static void register_commands() {
                return 0;
              });
 
-  g_cmds.add("reboot",
-             "Restart the MCU",
-             "reboot",
+  // reboot
+  g_cmds.add("reboot", "Restart the MCU", "reboot",
              [](const std::vector<std::string>&) -> int {
                if (!g_console) return 1;
                g_console->line("restarting...");
@@ -827,27 +967,202 @@ static void register_commands() {
                ESP.restart();
                return 0;
              });
+
+  // wifi
+  g_cmds.add("wifi",
+             "WiFi client commands",
+             "wifi scan [n] | wifi choose <i> [pass] | wifi set \"ssid\" \"pass\" | wifi connect [\"ssid\" \"pass\"] | wifi status | wifi disconnect | wifi clear",
+             [](const std::vector<std::string>& args) -> int {
+               if (!g_console) return 1;
+               if (args.size() < 2) {
+                 g_console->line("usage: wifi scan|choose|set|connect|status|disconnect|clear");
+                 return 2;
+               }
+               std::string sub = to_lower(args[1]);
+
+               if (sub == "scan") {
+                 int n = 15;
+                 if (args.size() >= 3) n = clampi(atoi(args[2].c_str()), 1, 30);
+                 g_console->line("scanning...");
+                 int found = g_wifi.scan(n);
+                 if (found <= 0) { g_console->line("no networks"); return 0; }
+                 const auto& v = g_wifi.last_scan();
+                 for (int i = 0; i < (int)v.size(); i++) {
+                   g_console->printf("%2d) %-24s rssi=%4d ch=%2d enc=%u\n",
+                                     i + 1, v[i].ssid.c_str(), (int)v[i].rssi, (int)v[i].channel, (unsigned)v[i].enc);
+                 }
+                 g_console->line("use: wifi choose <index> <pass>");
+                 return 0;
+               }
+
+               if (sub == "choose") {
+                 if (args.size() < 3) { g_console->line("usage: wifi choose <index> [pass]"); return 2; }
+                 int idx = atoi(args[2].c_str());
+                 std::string pass = (args.size() >= 4) ? args[3] : "";
+                 if (!g_wifi.choose_from_scan(idx, pass)) { g_console->line("bad index (scan first)"); return 2; }
+                 g_console->printf("saved ssid=%s (pass %s)\n", g_wifi.ssid().c_str(), pass.empty() ? "empty" : "set");
+                 return 0;
+               }
+
+               if (sub == "set") {
+                 if (args.size() != 4) { g_console->line("usage: wifi set \"ssid\" \"pass\""); return 2; }
+                 if (!g_wifi.save_creds(args[2], args[3])) { g_console->line("save failed"); return 3; }
+                 g_console->printf("saved ssid=%s (pass %s)\n", g_wifi.ssid().c_str(), args[3].empty() ? "empty" : "set");
+                 return 0;
+               }
+
+               if (sub == "connect") {
+                 bool ok = false;
+                 if (args.size() == 2) {
+                   g_wifi.load_creds();
+                   if (!g_wifi.has_creds()) { g_console->line("no saved ssid; use wifi set or wifi choose"); return 2; }
+                   g_console->printf("connecting ssid=%s ...\n", g_wifi.ssid().c_str());
+                   ok = g_wifi.connect_stored();
+                 } else if (args.size() == 4) {
+                   g_console->printf("connecting ssid=%s ...\n", args[2].c_str());
+                   ok = g_wifi.connect_using(args[2], args[3]);
+                 } else {
+                   g_console->line("usage: wifi connect [\"ssid\" \"pass\"]");
+                   return 2;
+                 }
+                 g_console->line(ok ? "connected" : "connect failed");
+                 if (ok) g_console->line(g_wifi.status_line());
+                 return ok ? 0 : 4;
+               }
+
+               if (sub == "status") {
+                 g_console->line(g_wifi.status_line());
+                 if (g_wifi.has_creds()) g_console->printf("saved_ssid=%s\n", g_wifi.ssid().c_str());
+                 else g_console->line("saved_ssid=-");
+                 return 0;
+               }
+
+               if (sub == "disconnect") {
+                 g_wifi.disconnect();
+                 g_console->line("disconnected");
+                 return 0;
+               }
+
+               if (sub == "clear") {
+                 g_wifi.clear_creds();
+                 g_console->line("cleared saved creds");
+                 return 0;
+               }
+
+               g_console->line("usage: wifi scan|choose|set|connect|status|disconnect|clear");
+               return 2;
+             });
+
+  // ping
+  g_cmds.add("ping",
+             "Ping a host (ICMP if available; else TCP timing)",
+             "ping <host> [count] [timeout_ms]",
+             [](const std::vector<std::string>& args) -> int {
+               if (!g_console) return 1;
+               if (args.size() < 2) { g_console->line("usage: ping <host> [count] [timeout_ms]"); return 2; }
+               if (!WiFi.isConnected()) { g_console->line("wifi not connected"); return 3; }
+
+               std::string host = args[1];
+               int count = (args.size() >= 3) ? clampi(atoi(args[2].c_str()), 1, 20) : 4;
+               int timeout_ms = (args.size() >= 4) ? clampi(atoi(args[3].c_str()), 100, 5000) : 1000;
+
+#if HAVE_ESP_PING
+               // ICMP ping using esp_ping (if present in this core build)
+               IPAddress ip;
+               if (!resolve_host(host, ip)) { g_console->line("dns failed"); return 4; }
+
+               ip_addr_t target_addr;
+               ip_addr_set_ip4_u32(&target_addr, (uint32_t)ip);
+
+               PingCtx ctx;
+
+               esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
+               cfg.target_addr = target_addr;
+               cfg.count = count;
+               cfg.timeout_ms = timeout_ms;
+               cfg.interval_ms = 200;
+
+               esp_ping_callbacks_t cbs = {};
+               cbs.on_ping_success = &on_ping_success;
+               cbs.on_ping_timeout = &on_ping_timeout;
+               cbs.on_ping_end = &on_ping_end;
+               cbs.cb_args = &ctx;
+
+               esp_ping_handle_t ping;
+               if (esp_ping_new_session(&cfg, &cbs, &ping) != ESP_OK) {
+                 g_console->line("ping init failed");
+                 return 5;
+               }
+
+               g_console->printf("ping %s (%s) count=%d timeout=%dms\n",
+                                 host.c_str(), ip.toString().c_str(), count, timeout_ms);
+
+               (void)esp_ping_start(ping);
+
+               uint32_t t0 = millis();
+               while (!ctx.done && (millis() - t0) < (uint32_t)(timeout_ms * count + 2000)) {
+                 delay(10);
+               }
+               (void)esp_ping_stop(ping);
+               (void)esp_ping_delete_session(ping);
+
+               g_console->printf("rx=%u/%u\n", (unsigned)ctx.received, (unsigned)count);
+               return (ctx.received > 0) ? 0 : 6;
+#else
+               // Fallback: TCP connect timing (not ICMP, but works without extra components)
+               g_console->printf("tcp-ping %s count=%d timeout=%dms\n", host.c_str(), count, timeout_ms);
+               int ok = 0;
+               for (int i = 0; i < count; i++) {
+                 int ms = tcp_ping_ms(host, 80, (uint32_t)timeout_ms);
+                 if (ms >= 0) {
+                   ok++;
+                   g_console->printf("%d: %dms\n", i + 1, ms);
+                 } else if (ms == -2) {
+                   g_console->line("dns failed");
+                   return 4;
+                 } else {
+                   g_console->printf("%d: timeout\n", i + 1);
+                 }
+                 delay(50);
+               }
+               g_console->printf("ok=%d/%d\n", ok, count);
+               g_console->line("note: ICMP ping not available in this build; using TCP connect timing.");
+               return (ok > 0) ? 0 : 6;
+#endif
+             });
 }
+
+static void setup_runtime() {
+  // Make WiFi stay in STA mode when used.
+  WiFi.mode(WIFI_OFF);
+}
+
+static ConsoleHistory g_hist("console");
+static CommandsRegistry g_registry;
+static Console* g_con = nullptr;
 
 void setup() {
   init_nvs();
-  (void)g_history.load();
+  (void)g_hist.load();
+  (void)g_wifi.load_creds();
+
   register_commands();
 
   Console::Config cfg;
   cfg.prompt = "esp32s3> ";
   cfg.ansi = true;
-  cfg.putty_bracket_fallback = true;   // default ON for your case
+  cfg.putty_bracket_fallback = true;
   cfg.max_line = 256;
-  cfg.esc_seq_timeout_ms = 2500;
-  cfg.bracket_peek_timeout_ms = 60;
 
-  static Console console(cfg, g_history, g_cmds);
-  g_console = &console;
+  static Console console(cfg, g_hist, g_registry);
+  g_con = &console;
+  g_console = &console; // for lambdas
+
+  setup_runtime();
   console.begin(115200);
 }
 
 void loop() {
-  if (g_console) g_console->loop_once();
+  if (g_con) g_con->loop_once();
   delay(1);
 }
