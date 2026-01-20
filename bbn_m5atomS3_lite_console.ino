@@ -27,27 +27,41 @@
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
 
-#include <cstdio>
-#include <cstring>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
 
-// -------------------- CRLF-safe print helpers (DO NOT use printf) --------------------
+// -------------------- CRLF-safe output (DO NOT use printf) --------------------
 
-static inline void out_raw(const char* s) {
-  if (s) Serial.print(s);
-}
-
-static inline void out_crlf() {
+static void out_crlf() {
   Serial.print("\r\n");
 }
 
-template <typename... Args>
-static void out_printf(const char* fmt, Args... args) {
-  Serial.printf(fmt, args...);
+static void out_vprintf(const char* fmt, va_list ap) {
+  char buf[512];
+  int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+  if (n <= 0) return;
+
+  // Ensure CRLF on any '\n' in the formatted text.
+  for (int i = 0; i < n && i < (int)sizeof(buf); i++) {
+    char c = buf[i];
+    if (c == '\n') Serial.write('\r');
+    Serial.write((uint8_t)c);
+  }
 }
 
-template <typename... Args>
-static void out_printfln(const char* fmt, Args... args) {
-  Serial.printf(fmt, args...);
+static void out_printf(const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  out_vprintf(fmt, ap);
+  va_end(ap);
+}
+
+static void out_printfln(const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  out_vprintf(fmt, ap);
+  va_end(ap);
   out_crlf();
 }
 
@@ -316,58 +330,6 @@ static bool read_line_edit(char* out, size_t out_cap, const char* prompt) {
             redraw_line(prompt, buf, len, cursor);
           }
         } break;
-        case 0x12: { // Ctrl+R (simple reverse search UI)
-          char query[64] = {0};
-          size_t qlen = 0;
-          char match[CONSOLE_LINE_MAX] = {0};
-
-          while (true) {
-            Serial.write('\r');
-            if (g_term_ansi) Serial.write("\x1b[2K");
-            Serial.print("(reverse-i-search)`");
-            if (qlen) Serial.write((const uint8_t*)query, qlen);
-            Serial.print("': ");
-            Serial.print(match);
-
-            int k = read_byte_blocking();
-            uint8_t uk = (uint8_t)k;
-            char kc = (char)uk;
-
-            if (kc == '\r' || kc == '\n') {
-              if (match[0]) {
-                strncpy(buf, match, sizeof(buf) - 1);
-                buf[sizeof(buf) - 1] = 0;
-                len = strnlen(buf, sizeof(buf) - 1);
-                cursor = len;
-              }
-              out_crlf();
-              redraw_line(prompt, buf, len, cursor);
-              break;
-            }
-            if (uk == 0x1B) { // ESC cancels
-              out_crlf();
-              redraw_line(prompt, buf, len, cursor);
-              break;
-            }
-            if (kc == '\b' || uk == 0x7F) {
-              if (qlen > 0) query[--qlen] = 0;
-            } else if (uk >= 0x20 && qlen + 1 < sizeof(query)) {
-              query[qlen++] = kc;
-              query[qlen] = 0;
-            }
-
-            match[0] = 0;
-            // Find first match backwards
-            for (int kk = 1; kk <= g_hist.count; kk++) {
-              const char* s = g_hist.get_by_recent_index(kk);
-              if (s && strstr(s, query)) {
-                strncpy(match, s, sizeof(match) - 1);
-                match[sizeof(match) - 1] = 0;
-                break;
-              }
-            }
-          }
-        } break;
         case 0x03: // Ctrl+C clears line
           out_crlf();
           buf[0] = 0;
@@ -456,11 +418,11 @@ static bool read_line_edit(char* out, size_t out_cap, const char* prompt) {
   }
 }
 
-// -------------------- Commands (Serial-only output) --------------------
+// -------------------- Commands (Serial output only) --------------------
 
 static int cmd_help(int, char**) {
   out_printfln("Commands: help free chip uptime reboot echo history keys term");
-  out_printfln("Keys: Up/Down hist, Ctrl+P/N hist, Ctrl+R search. term ansi|dumb");
+  out_printfln("Keys: Up/Down hist, Ctrl+P/N hist. term ansi|dumb");
   return ESP_OK;
 }
 
@@ -557,7 +519,7 @@ static int cmd_keys(int, char**) {
   while (millis() - t0 < 5000) {
     while (Serial.available()) {
       uint8_t b = (uint8_t)Serial.read();
-      Serial.printf("%02X ", (unsigned)b);
+      out_printf("%02X ", (unsigned)b);
     }
     delay(5);
   }
@@ -631,6 +593,7 @@ static const char* kPrompt = "esp32s3> ";
 
 void setup() {
   Serial.begin(115200);
+  Serial.setRxBufferSize(2048);
 
   uint32_t t0 = millis();
   while (!Serial && (millis() - t0) < 1500) delay(10);
@@ -644,7 +607,6 @@ void setup() {
 
   g_hist.load_from_nvs();
 
-  // esp_console init
   esp_console_config_t cfg = {};
   cfg.max_cmdline_length = CONSOLE_LINE_MAX;
   cfg.max_cmdline_args   = 8;
@@ -664,14 +626,13 @@ void loop() {
     return;
   }
 
-  // Trim leading spaces
   char* p = line;
   while (*p == ' ' || *p == '\t') p++;
   if (*p == 0) return;
 
   g_hist.add(p);
 
-  // IMPORTANT: start command output on a clean line
+  // Start command output on a clean line
   out_crlf();
 
   int ret = 0;
