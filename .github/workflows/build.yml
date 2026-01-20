@@ -19,7 +19,7 @@ jobs:
         #arduino-board-fqbn: esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc
         arduino-platform: esp32:esp32@3.3.5
         platform-url: https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
-        required-libraries: M5Unified@0.2.5
+        required-libraries: M5Unified@0.2.11
         sketch-names: "*.ino"
         sketch-names-find-start: bbn_*
         build-properties: '{ "All": "-DCONFIG_ESP_CONSOLE_USB_CDC=1 -DCONFIG_LIBC_STDOUT_LINE_ENDING_CRLF=1 -DCONFIG_LIBC_STDIN_LINE_ENDING_CR=1" }'
