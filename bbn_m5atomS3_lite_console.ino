@@ -1,31 +1,22 @@
 /*
-  Arduino-ESP32 3.3.5 console for PuTTY
+  Arduino-ESP32 3.3.5 console for PuTTY (M5AtomS3 / ESP32-S3)
   - ANSI line editor with mid-line cursor
   - Persistent history in NVS (survives reboot)
   - PuTTY arrows: ESC parser + fallback for missing ESC (treat "[A" etc as arrows)
 
   Commands:
-    help [cmd]
+    help
     history [n]
     uptime | chip | free | reboot
     wifi scan [n]
     wifi choose <index> [pass]
-    wifi set "<ssid>" "<pass>"
-    wifi connect [ "<ssid>" "<pass>" ]
+    wifi set "ssid" "pass"
+    wifi connect ["ssid" "pass"]
     wifi status | wifi disconnect | wifi clear
     ping <host> [count] [timeout_ms]
 
-  Keys:
-    Up/Down     history
-    Left/Right  cursor
-    Home/End    start/end
-    Backspace   delete left
-    Delete      delete at cursor
-    Ctrl+A/E    start/end
-    Ctrl+U/K    kill to start/end
-    Ctrl+W      delete previous word
-    Ctrl+L      clear screen + redraw
-    Ctrl+C      cancel line
+  Notes:
+    - "ping" here is TCP-connect timing (portable under Arduino).
 */
 
 #define CONFIG_ESP_CONSOLE_USB_CDC 1
@@ -52,16 +43,6 @@
 #include <vector>
 #include <functional>
 #include <algorithm>
-
-#if __has_include("esp_ping.h")
-  #define HAVE_ESP_PING 1
-  #include "esp_ping.h"
-  #include "esp_netif.h"
-  #include "lwip/inet.h"
-  #include "lwip/ip_addr.h"
-#else
-  #define HAVE_ESP_PING 0
-#endif
 
 // ------------------------------ small utils ------------------------------
 
@@ -292,13 +273,8 @@ public:
   bool load_creds() {
     nvs_handle_t h;
     if (nvs_open(ns_.c_str(), NVS_READONLY, &h) != ESP_OK) return false;
-
-    ssid_.clear();
-    pass_.clear();
-
     ssid_ = nvs_get_str_or_empty(h, "ssid");
     pass_ = nvs_get_str_or_empty(h, "pass");
-
     nvs_close(h);
     return !ssid_.empty();
   }
@@ -306,12 +282,10 @@ public:
   bool save_creds(const std::string& ssid, const std::string& pass) {
     nvs_handle_t h;
     if (nvs_open(ns_.c_str(), NVS_READWRITE, &h) != ESP_OK) return false;
-
     (void)nvs_set_str(h, "ssid", ssid.c_str());
     (void)nvs_set_str(h, "pass", pass.c_str());
     (void)nvs_commit(h);
     nvs_close(h);
-
     ssid_ = ssid;
     pass_ = pass;
     return true;
@@ -332,14 +306,13 @@ public:
   const std::string& ssid() const { return ssid_; }
   bool has_creds() const { return !ssid_.empty(); }
 
-  // Scan and store last results.
   int scan(int max_results = 15) {
     last_scan_.clear();
     WiFi.mode(WIFI_STA);
     WiFi.disconnect(true, true);
-    delay(50);
+    delay(80);
 
-    int n = WiFi.scanNetworks(/*async=*/false, /*hidden=*/true);
+    int n = WiFi.scanNetworks(false, true);
     if (n <= 0) return n;
 
     for (int i = 0; i < n && (int)last_scan_.size() < max_results; i++) {
@@ -364,13 +337,13 @@ public:
   bool connect_using(const std::string& ssid, const std::string& pass, uint32_t timeout_ms = 15000) {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect(false, true);
-    delay(50);
+    delay(80);
 
     WiFi.begin(ssid.c_str(), pass.c_str());
 
     uint32_t t0 = millis();
     while (WiFi.status() != WL_CONNECTED && (millis() - t0) < timeout_ms) {
-      delay(100);
+      delay(120);
     }
     return WiFi.status() == WL_CONNECTED;
   }
@@ -380,15 +353,12 @@ public:
     return connect_using(ssid_, pass_, timeout_ms);
   }
 
-  void disconnect() {
-    WiFi.disconnect(true, true);
-  }
+  void disconnect() { WiFi.disconnect(true, true); }
 
   std::string status_line() const {
     wl_status_t st = WiFi.status();
     const char* s = "unknown";
     switch (st) {
-      case WL_NO_SHIELD: s = "no-shield"; break;
       case WL_IDLE_STATUS: s = "idle"; break;
       case WL_NO_SSID_AVAIL: s = "no-ssid"; break;
       case WL_SCAN_COMPLETED: s = "scan-done"; break;
@@ -439,7 +409,6 @@ public:
     bool ansi = true;
     bool putty_bracket_fallback = true;
     size_t max_line = 256;
-
     uint32_t esc_seq_timeout_ms = 2500;
     uint32_t bracket_peek_timeout_ms = 60;
   };
@@ -497,9 +466,6 @@ public:
     }
   }
 
-  void set_ansi(bool on) { cfg_.ansi = on; }
-  void set_putty_fallback(bool on) { cfg_.putty_bracket_fallback = on; }
-
 private:
   enum class KeyType {
     Char, Enter,
@@ -519,7 +485,6 @@ private:
   std::string buf_;
   size_t cursor_ = 0;
 
-  // ANSI parser FSM
   enum class EscState { Idle, GotEsc, CSI, SS3 };
   EscState esc_state_ = EscState::Idle;
   uint32_t esc_deadline_ = 0;
@@ -565,7 +530,6 @@ private:
 
   Key read_key() {
     while (true) {
-      // Finish ESC sequence statefully (never leak bytes)
       if (esc_state_ != EscState::Idle) {
         if ((int32_t)(millis() - esc_deadline_) >= 0) {
           esc_state_ = EscState::Idle;
@@ -589,7 +553,6 @@ private:
           return map_arrow_final(b);
         }
 
-        // CSI
         if (b >= 0x40 && b <= 0x7E) {
           Key k = map_arrow_final(b);
           if (b == '~') {
@@ -612,7 +575,6 @@ private:
         }
       }
 
-      // Idle: get one byte
       uint8_t b = read_byte_blocking();
 
       if (b == '\r' || b == '\n') return {KeyType::Enter, 0};
@@ -639,7 +601,6 @@ private:
         continue;
       }
 
-      // PuTTY fallback: treat bare [A etc as arrows if ESC is missing.
       if (cfg_.putty_bracket_fallback && b == '[') {
         uint8_t next = 0;
         uint32_t dl = millis() + cfg_.bracket_peek_timeout_ms;
@@ -666,7 +627,6 @@ private:
             if (code == 1 || code == 7) return {KeyType::Home, 0};
             if (code == 4 || code == 8) return {KeyType::End, 0};
           }
-          // Not a known fallback => treat as literal '[' and ignore the other byte (rare)
           return {KeyType::Char, '['};
         }
         return {KeyType::Char, '['};
@@ -829,19 +789,15 @@ private:
   }
 };
 
-// ------------------------------ Ping helpers ------------------------------
+// ------------------------------ ping (TCP timing) ------------------------------
 
 static bool resolve_host(const std::string& host, IPAddress& out_ip) {
   if (!WiFi.isConnected()) return false;
   return WiFi.hostByName(host.c_str(), out_ip);
 }
 
-static int tcp_ping_ms(const std::string& host, uint16_t port, uint32_t timeout_ms) {
-  IPAddress ip;
-  if (!resolve_host(host, ip)) return -2;
-
+static int tcp_connect_ms(const IPAddress& ip, uint16_t port, uint32_t timeout_ms) {
   WiFiClient client;
-  client.setTimeout(timeout_ms / 1000);
   uint32_t t0 = millis();
   bool ok = client.connect(ip, port, timeout_ms);
   uint32_t dt = millis() - t0;
@@ -849,31 +805,7 @@ static int tcp_ping_ms(const std::string& host, uint16_t port, uint32_t timeout_
   return ok ? (int)dt : -1;
 }
 
-#if HAVE_ESP_PING
-struct PingCtx {
-  volatile bool done = false;
-  volatile uint32_t transmitted = 0;
-  volatile uint32_t received = 0;
-  volatile uint32_t time_ms = 0;
-};
-
-static void on_ping_success(esp_ping_handle_t, void* args) {
-  auto* ctx = (PingCtx*)args;
-  ctx->received++;
-}
-
-static void on_ping_timeout(esp_ping_handle_t, void* args) {
-  auto* ctx = (PingCtx*)args;
-  (void)ctx;
-}
-
-static void on_ping_end(esp_ping_handle_t, void* args) {
-  auto* ctx = (PingCtx*)args;
-  ctx->done = true;
-}
-#endif
-
-// ------------------------------ wiring ------------------------------
+// ------------------------------ globals + setup ------------------------------
 
 static ConsoleHistory g_history("console");
 static CommandsRegistry g_cmds;
@@ -889,32 +821,19 @@ static void init_nvs() {
 }
 
 static void register_commands() {
-  // help
-  g_cmds.add("help",
-             "Short help",
-             "help [command]",
-             [](const std::vector<std::string>& args) -> int {
+  g_cmds.add("help", "Short help", "help",
+             [](const std::vector<std::string>&) -> int {
                if (!g_console) return 1;
-               if (args.size() == 1) {
-                 g_console->line("Commands: help history uptime chip free reboot wifi ping");
-                 g_console->line("WiFi: wifi scan|choose|set|connect|status|disconnect|clear");
-                 return 0;
-               }
-               // (No detailed per-command registry print to keep output small)
+               g_console->line("Commands: help history uptime chip free reboot wifi ping");
+               g_console->line("WiFi: wifi scan|choose|set|connect|status|disconnect|clear");
                return 0;
              });
 
-  // history
-  g_cmds.add("history",
-             "Print persistent history",
-             "history [n]",
+  g_cmds.add("history", "Print persistent history", "history [n]",
              [](const std::vector<std::string>& args) -> int {
                if (!g_console) return 1;
                int n = g_history.size();
-               if (args.size() == 2) {
-                 n = atoi(args[1].c_str());
-                 n = clampi(n, 0, g_history.size());
-               }
+               if (args.size() == 2) n = clampi(atoi(args[1].c_str()), 0, g_history.size());
                auto lines = g_history.last_n(n);
                int idx0 = g_history.size() - (int)lines.size() + 1;
                for (size_t i = 0; i < lines.size(); i++) {
@@ -923,7 +842,6 @@ static void register_commands() {
                return 0;
              });
 
-  // uptime
   g_cmds.add("uptime", "Print uptime", "uptime",
              [](const std::vector<std::string>&) -> int {
                if (!g_console) return 1;
@@ -932,7 +850,6 @@ static void register_commands() {
                return 0;
              });
 
-  // chip
   g_cmds.add("chip", "Print chip info", "chip",
              [](const std::vector<std::string>&) -> int {
                if (!g_console) return 1;
@@ -948,7 +865,6 @@ static void register_commands() {
                return 0;
              });
 
-  // free
   g_cmds.add("free", "Print heap free/min", "free",
              [](const std::vector<std::string>&) -> int {
                if (!g_console) return 1;
@@ -958,7 +874,6 @@ static void register_commands() {
                return 0;
              });
 
-  // reboot
   g_cmds.add("reboot", "Restart the MCU", "reboot",
              [](const std::vector<std::string>&) -> int {
                if (!g_console) return 1;
@@ -968,10 +883,8 @@ static void register_commands() {
                return 0;
              });
 
-  // wifi
-  g_cmds.add("wifi",
-             "WiFi client commands",
-             "wifi scan [n] | wifi choose <i> [pass] | wifi set \"ssid\" \"pass\" | wifi connect [\"ssid\" \"pass\"] | wifi status | wifi disconnect | wifi clear",
+  g_cmds.add("wifi", "WiFi client commands",
+             "wifi scan [n] | wifi choose <i> [pass] | wifi set \"ssid\" \"pass\" | wifi connect [\"ssid\" \"pass\"] | wifi status|disconnect|clear",
              [](const std::vector<std::string>& args) -> int {
                if (!g_console) return 1;
                if (args.size() < 2) {
@@ -1032,6 +945,7 @@ static void register_commands() {
 
                if (sub == "status") {
                  g_console->line(g_wifi.status_line());
+                 g_wifi.load_creds();
                  if (g_wifi.has_creds()) g_console->printf("saved_ssid=%s\n", g_wifi.ssid().c_str());
                  else g_console->line("saved_ssid=-");
                  return 0;
@@ -1053,10 +967,7 @@ static void register_commands() {
                return 2;
              });
 
-  // ping
-  g_cmds.add("ping",
-             "Ping a host (ICMP if available; else TCP timing)",
-             "ping <host> [count] [timeout_ms]",
+  g_cmds.add("ping", "TCP connect timing to host (80 then 443)", "ping <host> [count] [timeout_ms]",
              [](const std::vector<std::string>& args) -> int {
                if (!g_console) return 1;
                if (args.size() < 2) { g_console->line("usage: ping <host> [count] [timeout_ms]"); return 2; }
@@ -1064,87 +975,40 @@ static void register_commands() {
 
                std::string host = args[1];
                int count = (args.size() >= 3) ? clampi(atoi(args[2].c_str()), 1, 20) : 4;
-               int timeout_ms = (args.size() >= 4) ? clampi(atoi(args[3].c_str()), 100, 5000) : 1000;
+               int timeout_ms = (args.size() >= 4) ? clampi(atoi(args[3].c_str()), 100, 8000) : 1000;
 
-#if HAVE_ESP_PING
-               // ICMP ping using esp_ping (if present in this core build)
                IPAddress ip;
                if (!resolve_host(host, ip)) { g_console->line("dns failed"); return 4; }
-
-               ip_addr_t target_addr;
-               ip_addr_set_ip4_u32(&target_addr, (uint32_t)ip);
-
-               PingCtx ctx;
-
-               esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
-               cfg.target_addr = target_addr;
-               cfg.count = count;
-               cfg.timeout_ms = timeout_ms;
-               cfg.interval_ms = 200;
-
-               esp_ping_callbacks_t cbs = {};
-               cbs.on_ping_success = &on_ping_success;
-               cbs.on_ping_timeout = &on_ping_timeout;
-               cbs.on_ping_end = &on_ping_end;
-               cbs.cb_args = &ctx;
-
-               esp_ping_handle_t ping;
-               if (esp_ping_new_session(&cfg, &cbs, &ping) != ESP_OK) {
-                 g_console->line("ping init failed");
-                 return 5;
-               }
 
                g_console->printf("ping %s (%s) count=%d timeout=%dms\n",
                                  host.c_str(), ip.toString().c_str(), count, timeout_ms);
 
-               (void)esp_ping_start(ping);
-
-               uint32_t t0 = millis();
-               while (!ctx.done && (millis() - t0) < (uint32_t)(timeout_ms * count + 2000)) {
-                 delay(10);
-               }
-               (void)esp_ping_stop(ping);
-               (void)esp_ping_delete_session(ping);
-
-               g_console->printf("rx=%u/%u\n", (unsigned)ctx.received, (unsigned)count);
-               return (ctx.received > 0) ? 0 : 6;
-#else
-               // Fallback: TCP connect timing (not ICMP, but works without extra components)
-               g_console->printf("tcp-ping %s count=%d timeout=%dms\n", host.c_str(), count, timeout_ms);
                int ok = 0;
                for (int i = 0; i < count; i++) {
-                 int ms = tcp_ping_ms(host, 80, (uint32_t)timeout_ms);
+                 int ms = tcp_connect_ms(ip, 80, (uint32_t)timeout_ms);
+                 if (ms < 0) ms = tcp_connect_ms(ip, 443, (uint32_t)timeout_ms);
+
                  if (ms >= 0) {
                    ok++;
                    g_console->printf("%d: %dms\n", i + 1, ms);
-                 } else if (ms == -2) {
-                   g_console->line("dns failed");
-                   return 4;
                  } else {
                    g_console->printf("%d: timeout\n", i + 1);
                  }
-                 delay(50);
+                 delay(60);
                }
                g_console->printf("ok=%d/%d\n", ok, count);
-               g_console->line("note: ICMP ping not available in this build; using TCP connect timing.");
+               g_console->line("note: ICMP not used; this is TCP connect timing.");
                return (ok > 0) ? 0 : 6;
-#endif
              });
 }
 
-static void setup_runtime() {
-  // Make WiFi stay in STA mode when used.
-  WiFi.mode(WIFI_OFF);
-}
-
-static ConsoleHistory g_hist("console");
-static CommandsRegistry g_registry;
-static Console* g_con = nullptr;
-
 void setup() {
   init_nvs();
-  (void)g_hist.load();
+  (void)g_history.load();
   (void)g_wifi.load_creds();
+
+  // keep WiFi off until user uses wifi commands
+  WiFi.mode(WIFI_OFF);
 
   register_commands();
 
@@ -1154,15 +1018,13 @@ void setup() {
   cfg.putty_bracket_fallback = true;
   cfg.max_line = 256;
 
-  static Console console(cfg, g_hist, g_registry);
-  g_con = &console;
-  g_console = &console; // for lambdas
+  static Console console(cfg, g_history, g_cmds);
+  g_console = &console;
 
-  setup_runtime();
   console.begin(115200);
 }
 
 void loop() {
-  if (g_con) g_con->loop_once();
+  if (g_console) g_console->loop_once();
   delay(1);
 }
