@@ -1,8 +1,10 @@
 /*
-  Arduino-ESP32 3.3.5 console for PuTTY (M5AtomS3 / ESP32-S3)
+  Arduino-ESP32 3.3.5 console + WiFi + WebServer for PuTTY (M5AtomS3 / ESP32-S3)
   - ANSI line editor with mid-line cursor
   - Persistent history in NVS (survives reboot)
   - PuTTY arrows: ESC parser + fallback for missing ESC (treat "[A" etc as arrows)
+  - Auto-connect WiFi on boot if creds exist
+  - WebController runs WebServer in its own FreeRTOS task (so console blocking input doesn't starve HTTP)
 
   Commands:
     help
@@ -14,9 +16,11 @@
     wifi connect ["ssid" "pass"]
     wifi status | wifi disconnect | wifi clear
     ping <host> [count] [timeout_ms]
+    web start [port] | web stop | web status
 
-  Notes:
-    - "ping" here is TCP-connect timing (portable under Arduino).
+  Web:
+    GET /         welcome page
+    GET /status   basic status
 */
 
 #define CONFIG_ESP_CONSOLE_USB_CDC 1
@@ -33,6 +37,7 @@
 #include <esp_timer.h>
 
 #include <WiFi.h>
+#include <WebServer.h>
 
 #include <cstdint>
 #include <cstdarg>
@@ -43,6 +48,7 @@
 #include <vector>
 #include <functional>
 #include <algorithm>
+#include <memory>
 
 // ------------------------------ small utils ------------------------------
 
@@ -218,43 +224,34 @@ class CommandsRegistry {
 public:
   using Handler = std::function<int(const std::vector<std::string>& args)>;
 
-  struct Command {
-    std::string name;
-    std::string help;
-    std::string usage;
-    Handler handler;
-  };
-
-  void add(std::string name, std::string help, std::string usage, Handler handler) {
+  void add(std::string name, Handler handler) {
     name = to_lower(std::move(name));
-    Command c{std::move(name), std::move(help), std::move(usage), std::move(handler)};
-
     for (auto &x : cmds_) {
-      if (x.name == c.name) { x = std::move(c); return; }
+      if (x.name == name) { x.handler = std::move(handler); return; }
     }
-    cmds_.push_back(std::move(c));
+    cmds_.push_back({name, std::move(handler)});
     std::sort(cmds_.begin(), cmds_.end(),
-              [](const Command& a, const Command& b){ return a.name < b.name; });
-  }
-
-  const Command* find(const std::string& name) const {
-    std::string key = to_lower(name);
-    for (const auto& c : cmds_) if (c.name == key) return &c;
-    return nullptr;
+              [](const Cmd& a, const Cmd& b){ return a.name < b.name; });
   }
 
   int run_line(const std::string& line) const {
     auto argv = split_argv(line);
     if (argv.empty()) return 0;
-    const Command* cmd = find(argv[0]);
-    if (!cmd) return err_not_found;
-    return cmd->handler(argv);
+    std::string key = to_lower(argv[0]);
+    for (const auto& c : cmds_) {
+      if (c.name == key) return c.handler(argv);
+    }
+    return err_not_found;
   }
 
   static constexpr int err_not_found = 127;
 
 private:
-  std::vector<Command> cmds_;
+  struct Cmd {
+    std::string name;
+    Handler handler;
+  };
+  std::vector<Cmd> cmds_;
 };
 
 // ------------------------------ WifiManager ------------------------------
@@ -304,6 +301,7 @@ public:
   }
 
   const std::string& ssid() const { return ssid_; }
+  const std::string& pass() const { return pass_; }
   bool has_creds() const { return !ssid_.empty(); }
 
   int scan(int max_results = 15) {
@@ -400,6 +398,121 @@ private:
   }
 };
 
+// ------------------------------ WebController ------------------------------
+
+class WebController {
+public:
+  WebController() = default;
+
+  void set_default_port(uint16_t p) { default_port_ = p; }
+
+  bool is_running() const { return running_; }
+  uint16_t port() const { return port_; }
+
+  bool start(uint16_t port = 0) {
+    if (running_) return true;
+    if (port == 0) port = default_port_;
+    if (!WiFi.isConnected()) return false;
+
+    port_ = port;
+    server_ = std::make_unique<WebServer>(port_);
+
+    setup_routes(*server_);
+
+    server_->begin();
+    running_ = true;
+
+    if (task_ == nullptr) {
+      xTaskCreatePinnedToCore(&WebController::task_thunk,
+                              "websrv",
+                              4096,
+                              this,
+                              1,
+                              &task_,
+                              0);
+    }
+    return true;
+  }
+
+  void stop() {
+    running_ = false;
+    if (server_) {
+      server_->stop();
+      server_.reset();
+    }
+  }
+
+  std::string status_line() const {
+    char buf[128];
+    snprintf(buf, sizeof(buf), "web=%s port=%u",
+             running_ ? "running" : "stopped",
+             (unsigned)port_);
+    return buf;
+  }
+
+private:
+  uint16_t default_port_ = 80;
+  uint16_t port_ = 80;
+  std::unique_ptr<WebServer> server_;
+  volatile bool running_ = false;
+  TaskHandle_t task_ = nullptr;
+
+  static void task_thunk(void* arg) {
+    static_cast<WebController*>(arg)->task_loop();
+  }
+
+  void task_loop() {
+    while (true) {
+      if (running_ && server_) {
+        server_->handleClient();
+      }
+      vTaskDelay(pdMS_TO_TICKS(5));
+    }
+  }
+
+  void setup_routes(WebServer& s) {
+    s.on("/", HTTP_GET, [this, &s]() {
+      String ip = WiFi.localIP().toString();
+      String ssid = WiFi.SSID();
+      String html;
+      html.reserve(1024);
+      html += "<!doctype html><html><head><meta charset='utf-8'>"
+              "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+              "<title>ESP32S3</title></head><body>"
+              "<h2>ESP32S3 Web Console</h2>";
+      html += "<p><b>SSID:</b> " + ssid + "<br><b>IP:</b> " + ip + "</p>";
+      html += "<ul>"
+              "<li><a href='/status'>/status</a></li>"
+              "</ul>";
+      html += "<p>Use serial console for commands.</p>";
+      html += "</body></html>";
+      s.send(200, "text/html", html);
+    });
+
+    s.on("/status", HTTP_GET, [this, &s]() {
+      String ip = WiFi.localIP().toString();
+      String ssid = WiFi.SSID();
+      uint32_t heap = esp_get_free_heap_size();
+      uint64_t us = esp_timer_get_time();
+
+      String json;
+      json.reserve(256);
+      json += "{";
+      json += "\"ssid\":\"" + ssid + "\",";
+      json += "\"ip\":\"" + ip + "\",";
+      json += "\"heap_free\":" + String(heap) + ",";
+      json += "\"uptime_s\":" + String((double)us * 1e-6, 3) + ",";
+      json += "\"web_port\":" + String(port_) + "";
+      json += "}";
+      s.send(200, "application/json", json);
+    });
+
+    s.onNotFound([&s]() {
+      s.send(404, "text/plain", "404");
+    });
+  }
+};
+
 // ------------------------------ Console (editor + io) ------------------------------
 
 class Console {
@@ -445,9 +558,6 @@ public:
     }
   }
 
-  // output helpers
-  void print(const char* s) { if (s) Serial.print(s); }
-  void print(const std::string& s) { Serial.print(s.c_str()); }
   void crlf() { Serial.print("\r\n"); }
   void line(const char* s) { if (s) Serial.print(s); crlf(); }
   void line(const std::string& s) { Serial.print(s.c_str()); crlf(); }
@@ -475,7 +585,6 @@ private:
     CtrlA, CtrlE, CtrlU, CtrlK, CtrlW, CtrlL, CtrlC,
     Unknown
   };
-
   struct Key { KeyType type; char ch; };
 
   Config cfg_;
@@ -601,6 +710,7 @@ private:
         continue;
       }
 
+      // PuTTY fallback: treat bare [A etc as arrows if ESC is missing.
       if (cfg_.putty_bracket_fallback && b == '[') {
         uint8_t next = 0;
         uint32_t dl = millis() + cfg_.bracket_peek_timeout_ms;
@@ -810,7 +920,12 @@ static int tcp_connect_ms(const IPAddress& ip, uint16_t port, uint32_t timeout_m
 static ConsoleHistory g_history("console");
 static CommandsRegistry g_cmds;
 static WifiManager g_wifi("wifi");
+static WebController g_web;
 static Console* g_console = nullptr;
+
+static constexpr bool kAutoConnectWiFiOnBoot = true;
+static constexpr bool kAutoStartWebOnWiFi = true;
+static constexpr uint16_t kDefaultWebPort = 80;
 
 static void init_nvs() {
   esp_err_t err = nvs_flash_init();
@@ -821,185 +936,218 @@ static void init_nvs() {
 }
 
 static void register_commands() {
-  g_cmds.add("help", "Short help", "help",
-             [](const std::vector<std::string>&) -> int {
-               if (!g_console) return 1;
-               g_console->line("Commands: help history uptime chip free reboot wifi ping");
-               g_console->line("WiFi: wifi scan|choose|set|connect|status|disconnect|clear");
-               return 0;
-             });
+  g_cmds.add("help", [](const std::vector<std::string>&) -> int {
+    if (!g_console) return 1;
+    g_console->line("Commands: help history uptime chip free reboot wifi ping web");
+    g_console->line("WiFi: wifi scan|choose|set|connect|status|disconnect|clear");
+    g_console->line("Web:  web start [port] | web stop | web status  (GET /, /status)");
+    return 0;
+  });
 
-  g_cmds.add("history", "Print persistent history", "history [n]",
-             [](const std::vector<std::string>& args) -> int {
-               if (!g_console) return 1;
-               int n = g_history.size();
-               if (args.size() == 2) n = clampi(atoi(args[1].c_str()), 0, g_history.size());
-               auto lines = g_history.last_n(n);
-               int idx0 = g_history.size() - (int)lines.size() + 1;
-               for (size_t i = 0; i < lines.size(); i++) {
-                 g_console->printf("%4d  %s\n", idx0 + (int)i, lines[i].c_str());
-               }
-               return 0;
-             });
+  g_cmds.add("history", [](const std::vector<std::string>& args) -> int {
+    if (!g_console) return 1;
+    int n = g_history.size();
+    if (args.size() == 2) n = clampi(atoi(args[1].c_str()), 0, g_history.size());
+    auto lines = g_history.last_n(n);
+    int idx0 = g_history.size() - (int)lines.size() + 1;
+    for (size_t i = 0; i < lines.size(); i++) {
+      g_console->printf("%4d  %s\n", idx0 + (int)i, lines[i].c_str());
+    }
+    return 0;
+  });
 
-  g_cmds.add("uptime", "Print uptime", "uptime",
-             [](const std::vector<std::string>&) -> int {
-               if (!g_console) return 1;
-               double s = (double)esp_timer_get_time() * 1e-6;
-               g_console->printf("uptime=%.3fs\n", s);
-               return 0;
-             });
+  g_cmds.add("uptime", [](const std::vector<std::string>&) -> int {
+    if (!g_console) return 1;
+    double s = (double)esp_timer_get_time() * 1e-6;
+    g_console->printf("uptime=%.3fs\n", s);
+    return 0;
+  });
 
-  g_cmds.add("chip", "Print chip info", "chip",
-             [](const std::vector<std::string>&) -> int {
-               if (!g_console) return 1;
-               esp_chip_info_t info;
-               esp_chip_info(&info);
-               const char* model = "unknown";
-               if (info.model == CHIP_ESP32S3) model = "S3";
-               else if (info.model == CHIP_ESP32S2) model = "S2";
-               else if (info.model == CHIP_ESP32C3) model = "C3";
-               else if (info.model == CHIP_ESP32C6) model = "C6";
-               g_console->printf("ESP32-%s cores=%d rev=%d flash=%u\n",
-                                 model, info.cores, info.revision, (unsigned)ESP.getFlashChipSize());
-               return 0;
-             });
+  g_cmds.add("chip", [](const std::vector<std::string>&) -> int {
+    if (!g_console) return 1;
+    esp_chip_info_t info;
+    esp_chip_info(&info);
+    const char* model = "unknown";
+    if (info.model == CHIP_ESP32S3) model = "S3";
+    else if (info.model == CHIP_ESP32S2) model = "S2";
+    else if (info.model == CHIP_ESP32C3) model = "C3";
+    else if (info.model == CHIP_ESP32C6) model = "C6";
+    g_console->printf("ESP32-%s cores=%d rev=%d flash=%u\n",
+                      model, info.cores, info.revision, (unsigned)ESP.getFlashChipSize());
+    return 0;
+  });
 
-  g_cmds.add("free", "Print heap free/min", "free",
-             [](const std::vector<std::string>&) -> int {
-               if (!g_console) return 1;
-               g_console->printf("heap_free=%u heap_min_free=%u\n",
-                                 (unsigned)esp_get_free_heap_size(),
-                                 (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT));
-               return 0;
-             });
+  g_cmds.add("free", [](const std::vector<std::string>&) -> int {
+    if (!g_console) return 1;
+    g_console->printf("heap_free=%u heap_min_free=%u\n",
+                      (unsigned)esp_get_free_heap_size(),
+                      (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT));
+    return 0;
+  });
 
-  g_cmds.add("reboot", "Restart the MCU", "reboot",
-             [](const std::vector<std::string>&) -> int {
-               if (!g_console) return 1;
-               g_console->line("restarting...");
-               delay(50);
-               ESP.restart();
-               return 0;
-             });
+  g_cmds.add("reboot", [](const std::vector<std::string>&) -> int {
+    if (!g_console) return 1;
+    g_console->line("restarting...");
+    delay(50);
+    ESP.restart();
+    return 0;
+  });
 
-  g_cmds.add("wifi", "WiFi client commands",
-             "wifi scan [n] | wifi choose <i> [pass] | wifi set \"ssid\" \"pass\" | wifi connect [\"ssid\" \"pass\"] | wifi status|disconnect|clear",
-             [](const std::vector<std::string>& args) -> int {
-               if (!g_console) return 1;
-               if (args.size() < 2) {
-                 g_console->line("usage: wifi scan|choose|set|connect|status|disconnect|clear");
-                 return 2;
-               }
-               std::string sub = to_lower(args[1]);
+  g_cmds.add("wifi", [](const std::vector<std::string>& args) -> int {
+    if (!g_console) return 1;
+    if (args.size() < 2) {
+      g_console->line("usage: wifi scan|choose|set|connect|status|disconnect|clear");
+      return 2;
+    }
+    std::string sub = to_lower(args[1]);
 
-               if (sub == "scan") {
-                 int n = 15;
-                 if (args.size() >= 3) n = clampi(atoi(args[2].c_str()), 1, 30);
-                 g_console->line("scanning...");
-                 int found = g_wifi.scan(n);
-                 if (found <= 0) { g_console->line("no networks"); return 0; }
-                 const auto& v = g_wifi.last_scan();
-                 for (int i = 0; i < (int)v.size(); i++) {
-                   g_console->printf("%2d) %-24s rssi=%4d ch=%2d enc=%u\n",
-                                     i + 1, v[i].ssid.c_str(), (int)v[i].rssi, (int)v[i].channel, (unsigned)v[i].enc);
-                 }
-                 g_console->line("use: wifi choose <index> <pass>");
-                 return 0;
-               }
+    if (sub == "scan") {
+      int n = 15;
+      if (args.size() >= 3) n = clampi(atoi(args[2].c_str()), 1, 30);
+      g_console->line("scanning...");
+      int found = g_wifi.scan(n);
+      if (found <= 0) { g_console->line("no networks"); return 0; }
+      const auto& v = g_wifi.last_scan();
+      for (int i = 0; i < (int)v.size(); i++) {
+        g_console->printf("%2d) %-24s rssi=%4d ch=%2d enc=%u\n",
+                          i + 1, v[i].ssid.c_str(), (int)v[i].rssi, (int)v[i].channel, (unsigned)v[i].enc);
+      }
+      g_console->line("use: wifi choose <index> <pass>");
+      return 0;
+    }
 
-               if (sub == "choose") {
-                 if (args.size() < 3) { g_console->line("usage: wifi choose <index> [pass]"); return 2; }
-                 int idx = atoi(args[2].c_str());
-                 std::string pass = (args.size() >= 4) ? args[3] : "";
-                 if (!g_wifi.choose_from_scan(idx, pass)) { g_console->line("bad index (scan first)"); return 2; }
-                 g_console->printf("saved ssid=%s (pass %s)\n", g_wifi.ssid().c_str(), pass.empty() ? "empty" : "set");
-                 return 0;
-               }
+    if (sub == "choose") {
+      if (args.size() < 3) { g_console->line("usage: wifi choose <index> [pass]"); return 2; }
+      int idx = atoi(args[2].c_str());
+      std::string pass = (args.size() >= 4) ? args[3] : "";
+      if (!g_wifi.choose_from_scan(idx, pass)) { g_console->line("bad index (scan first)"); return 2; }
+      g_console->printf("saved ssid=%s (pass %s)\n", g_wifi.ssid().c_str(), pass.empty() ? "empty" : "set");
+      return 0;
+    }
 
-               if (sub == "set") {
-                 if (args.size() != 4) { g_console->line("usage: wifi set \"ssid\" \"pass\""); return 2; }
-                 if (!g_wifi.save_creds(args[2], args[3])) { g_console->line("save failed"); return 3; }
-                 g_console->printf("saved ssid=%s (pass %s)\n", g_wifi.ssid().c_str(), args[3].empty() ? "empty" : "set");
-                 return 0;
-               }
+    if (sub == "set") {
+      if (args.size() != 4) { g_console->line("usage: wifi set \"ssid\" \"pass\""); return 2; }
+      if (!g_wifi.save_creds(args[2], args[3])) { g_console->line("save failed"); return 3; }
+      g_console->printf("saved ssid=%s (pass %s)\n", g_wifi.ssid().c_str(), args[3].empty() ? "empty" : "set");
+      return 0;
+    }
 
-               if (sub == "connect") {
-                 bool ok = false;
-                 if (args.size() == 2) {
-                   g_wifi.load_creds();
-                   if (!g_wifi.has_creds()) { g_console->line("no saved ssid; use wifi set or wifi choose"); return 2; }
-                   g_console->printf("connecting ssid=%s ...\n", g_wifi.ssid().c_str());
-                   ok = g_wifi.connect_stored();
-                 } else if (args.size() == 4) {
-                   g_console->printf("connecting ssid=%s ...\n", args[2].c_str());
-                   ok = g_wifi.connect_using(args[2], args[3]);
-                 } else {
-                   g_console->line("usage: wifi connect [\"ssid\" \"pass\"]");
-                   return 2;
-                 }
-                 g_console->line(ok ? "connected" : "connect failed");
-                 if (ok) g_console->line(g_wifi.status_line());
-                 return ok ? 0 : 4;
-               }
+    if (sub == "connect") {
+      bool ok = false;
+      if (args.size() == 2) {
+        g_wifi.load_creds();
+        if (!g_wifi.has_creds()) { g_console->line("no saved ssid; use wifi set or wifi choose"); return 2; }
+        g_console->printf("connecting ssid=%s ...\n", g_wifi.ssid().c_str());
+        ok = g_wifi.connect_stored();
+      } else if (args.size() == 4) {
+        g_console->printf("connecting ssid=%s ...\n", args[2].c_str());
+        ok = g_wifi.connect_using(args[2], args[3]);
+        if (ok) (void)g_wifi.save_creds(args[2], args[3]);
+      } else {
+        g_console->line("usage: wifi connect [\"ssid\" \"pass\"]");
+        return 2;
+      }
+      g_console->line(ok ? "connected" : "connect failed");
+      if (ok) {
+        g_console->line(g_wifi.status_line());
+        if (kAutoStartWebOnWiFi && !g_web.is_running()) {
+          bool ws = g_web.start(kDefaultWebPort);
+          if (ws) g_console->printf("web started: http://%s/\n", WiFi.localIP().toString().c_str());
+          else g_console->line("web start failed");
+        }
+      }
+      return ok ? 0 : 4;
+    }
 
-               if (sub == "status") {
-                 g_console->line(g_wifi.status_line());
-                 g_wifi.load_creds();
-                 if (g_wifi.has_creds()) g_console->printf("saved_ssid=%s\n", g_wifi.ssid().c_str());
-                 else g_console->line("saved_ssid=-");
-                 return 0;
-               }
+    if (sub == "status") {
+      g_console->line(g_wifi.status_line());
+      g_wifi.load_creds();
+      if (g_wifi.has_creds()) g_console->printf("saved_ssid=%s\n", g_wifi.ssid().c_str());
+      else g_console->line("saved_ssid=-");
+      return 0;
+    }
 
-               if (sub == "disconnect") {
-                 g_wifi.disconnect();
-                 g_console->line("disconnected");
-                 return 0;
-               }
+    if (sub == "disconnect") {
+      g_wifi.disconnect();
+      g_console->line("disconnected");
+      return 0;
+    }
 
-               if (sub == "clear") {
-                 g_wifi.clear_creds();
-                 g_console->line("cleared saved creds");
-                 return 0;
-               }
+    if (sub == "clear") {
+      g_wifi.clear_creds();
+      g_console->line("cleared saved creds");
+      return 0;
+    }
 
-               g_console->line("usage: wifi scan|choose|set|connect|status|disconnect|clear");
-               return 2;
-             });
+    g_console->line("usage: wifi scan|choose|set|connect|status|disconnect|clear");
+    return 2;
+  });
 
-  g_cmds.add("ping", "TCP connect timing to host (80 then 443)", "ping <host> [count] [timeout_ms]",
-             [](const std::vector<std::string>& args) -> int {
-               if (!g_console) return 1;
-               if (args.size() < 2) { g_console->line("usage: ping <host> [count] [timeout_ms]"); return 2; }
-               if (!WiFi.isConnected()) { g_console->line("wifi not connected"); return 3; }
+  g_cmds.add("ping", [](const std::vector<std::string>& args) -> int {
+    if (!g_console) return 1;
+    if (args.size() < 2) { g_console->line("usage: ping <host> [count] [timeout_ms]"); return 2; }
+    if (!WiFi.isConnected()) { g_console->line("wifi not connected"); return 3; }
 
-               std::string host = args[1];
-               int count = (args.size() >= 3) ? clampi(atoi(args[2].c_str()), 1, 20) : 4;
-               int timeout_ms = (args.size() >= 4) ? clampi(atoi(args[3].c_str()), 100, 8000) : 1000;
+    std::string host = args[1];
+    int count = (args.size() >= 3) ? clampi(atoi(args[2].c_str()), 1, 20) : 4;
+    int timeout_ms = (args.size() >= 4) ? clampi(atoi(args[3].c_str()), 100, 8000) : 1000;
 
-               IPAddress ip;
-               if (!resolve_host(host, ip)) { g_console->line("dns failed"); return 4; }
+    IPAddress ip;
+    if (!resolve_host(host, ip)) { g_console->line("dns failed"); return 4; }
 
-               g_console->printf("ping %s (%s) count=%d timeout=%dms\n",
-                                 host.c_str(), ip.toString().c_str(), count, timeout_ms);
+    g_console->printf("ping %s (%s) count=%d timeout=%dms\n",
+                      host.c_str(), ip.toString().c_str(), count, timeout_ms);
 
-               int ok = 0;
-               for (int i = 0; i < count; i++) {
-                 int ms = tcp_connect_ms(ip, 80, (uint32_t)timeout_ms);
-                 if (ms < 0) ms = tcp_connect_ms(ip, 443, (uint32_t)timeout_ms);
+    int ok = 0;
+    for (int i = 0; i < count; i++) {
+      int ms = tcp_connect_ms(ip, 80, (uint32_t)timeout_ms);
+      if (ms < 0) ms = tcp_connect_ms(ip, 443, (uint32_t)timeout_ms);
 
-                 if (ms >= 0) {
-                   ok++;
-                   g_console->printf("%d: %dms\n", i + 1, ms);
-                 } else {
-                   g_console->printf("%d: timeout\n", i + 1);
-                 }
-                 delay(60);
-               }
-               g_console->printf("ok=%d/%d\n", ok, count);
-               g_console->line("note: ICMP not used; this is TCP connect timing.");
-               return (ok > 0) ? 0 : 6;
-             });
+      if (ms >= 0) { ok++; g_console->printf("%d: %dms\n", i + 1, ms); }
+      else         { g_console->printf("%d: timeout\n", i + 1); }
+
+      delay(60);
+    }
+    g_console->printf("ok=%d/%d\n", ok, count);
+    g_console->line("note: TCP connect timing (not ICMP).");
+    return (ok > 0) ? 0 : 6;
+  });
+
+  g_cmds.add("web", [](const std::vector<std::string>& args) -> int {
+    if (!g_console) return 1;
+    if (args.size() < 2) {
+      g_console->line("usage: web start [port] | web stop | web status");
+      return 2;
+    }
+    std::string sub = to_lower(args[1]);
+
+    if (sub == "status") {
+      g_console->line(g_web.status_line());
+      if (g_web.is_running()) g_console->printf("url: http://%s:%u/\n",
+                                                WiFi.localIP().toString().c_str(),
+                                                (unsigned)g_web.port());
+      return 0;
+    }
+
+    if (sub == "stop") {
+      g_web.stop();
+      g_console->line("web stopped");
+      return 0;
+    }
+
+    if (sub == "start") {
+      uint16_t port = kDefaultWebPort;
+      if (args.size() >= 3) port = (uint16_t)clampi(atoi(args[2].c_str()), 1, 65535);
+      if (!WiFi.isConnected()) { g_console->line("wifi not connected"); return 3; }
+      bool ok = g_web.start(port);
+      if (ok) g_console->printf("web started: http://%s:%u/\n", WiFi.localIP().toString().c_str(), (unsigned)port);
+      else g_console->line("web start failed");
+      return ok ? 0 : 4;
+    }
+
+    g_console->line("usage: web start [port] | web stop | web status");
+    return 2;
+  });
 }
 
 void setup() {
@@ -1007,7 +1155,7 @@ void setup() {
   (void)g_history.load();
   (void)g_wifi.load_creds();
 
-  // keep WiFi off until user uses wifi commands
+  // WiFi off until we decide to connect
   WiFi.mode(WIFI_OFF);
 
   register_commands();
@@ -1021,10 +1169,30 @@ void setup() {
   static Console console(cfg, g_history, g_cmds);
   g_console = &console;
 
+  g_web.set_default_port(kDefaultWebPort);
+
   console.begin(115200);
+
+  // Auto-connect WiFi on boot if creds exist
+  if (kAutoConnectWiFiOnBoot) {
+    g_wifi.load_creds();
+    if (g_wifi.has_creds()) {
+      console.printf("auto wifi connect ssid=%s ...\n", g_wifi.ssid().c_str());
+      bool ok = g_wifi.connect_stored(15000);
+      console.line(ok ? "connected" : "connect failed");
+      if (ok) {
+        console.line(g_wifi.status_line());
+        if (kAutoStartWebOnWiFi) {
+          bool ws = g_web.start(kDefaultWebPort);
+          if (ws) console.printf("web started: http://%s/\n", WiFi.localIP().toString().c_str());
+          else console.line("web start failed");
+        }
+      }
+    }
+  }
 }
 
 void loop() {
-  if (g_console) g_console->loop_once();
+  if (g_console) g_console->loop_once();  // blocks on input; web server runs in its own task
   delay(1);
 }
