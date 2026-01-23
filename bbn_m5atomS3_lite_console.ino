@@ -1,4 +1,10 @@
 /*
+
+  Copyright 2026, Mikhail Grushinskiy
+
+*/
+
+/*
   Arduino-ESP32 3.3.5 console + WiFi + WebServer for PuTTY (M5AtomS3 / ESP32-S3)
   - ANSI line editor with mid-line cursor
   - Persistent history in NVS (survives reboot)
